@@ -1,0 +1,46 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float16_t data_buf[]; };
+layout(set = 0, binding = 1) buffer readonly CosTable { float cos_table[]; };
+layout(set = 0, binding = 2) buffer readonly SinTable { float sin_table[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint num_heads;
+#ifdef BATCH_MODE
+    uint start_position;
+#else
+    uint position;
+#endif
+    uint half_dim;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = num_heads * half_dim;
+    if (idx >= total) return;
+
+    uint head = idx / half_dim;
+    uint i = idx % half_dim;
+
+#ifdef BATCH_MODE
+    uint batch_idx = gl_WorkGroupID.y;
+    uint pos = start_position + batch_idx;
+    uint base = batch_idx * num_heads * head_dim + head * head_dim;
+#else
+    uint pos = position;
+    uint base = head * head_dim;
+#endif
+
+    float first = float(data_buf[base + i]);
+    float second = float(data_buf[base + half_dim + i]);
+
+    float cos_val = cos_table[pos * half_dim + i];
+    float sin_val = sin_table[pos * half_dim + i];
+
+    data_buf[base + i] = float16_t(first * cos_val - second * sin_val);
+    data_buf[base + half_dim + i] = float16_t(first * sin_val + second * cos_val);
+}

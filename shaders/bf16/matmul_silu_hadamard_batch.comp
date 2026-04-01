@@ -1,0 +1,132 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Tiled GEMM with fused SiLU and Hadamard product:
+// gate[M,N] = A[M,K] x Gate^T[N,K]
+// up[M,N]   = A[M,K] x Up^T[N,K]
+// output[M,N] = SiLU(gate[M,N]) x up[M,N]
+//
+// A = input activations (f16, row-major [M x K])
+// Gate, Up = weight matrices (bf16 packed, row-major [N x K/2])
+// Output = (f16, row-major [M x N])
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 16
+#define WG_M 8
+#define WG_N 32
+#define THREAD_M 8
+#define THREAD_N 4
+#define A_STRIDE 17
+#define B_STRIDE 17
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float16_t A_tile[TILE_M * A_STRIDE];    // 64 x 17 x 2 = 2.18 KB
+shared float16_t G_tile[TILE_N * B_STRIDE];    // 128 x 17 x 2 = 4.35 KB
+shared float16_t U_tile[TILE_N * B_STRIDE];    // 128 x 17 x 2 = 4.35 KB
+                                                // Total: ~10.9 KB
+
+// BF16 -> fp16 with clamping (BF16 range exceeds fp16)
+float16_t bf16ToFp16(uint bf16_bits) {
+    float val = uintBitsToFloat(bf16_bits << 16);
+    return float16_t(clamp(val, -65504.0, 65504.0));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;
+    uint wg_m = gl_WorkGroupID.y;
+
+    uint thread_m = tid / WG_N;
+    uint thread_n = tid % WG_N;
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    // Dual accumulators: 32 for gate, 32 for up = 64 registers
+    float gate_acc[THREAD_M * THREAD_N];
+    float up_acc[THREAD_M * THREAD_N];
+    for (uint i = 0; i < THREAD_M * THREAD_N; i++) {
+        gate_acc[i] = 0.0;
+        up_acc[i] = 0.0;
+    }
+
+    for (uint k_base = 0; k_base < in_dim; k_base += TILE_K) {
+        // Load A tile: f16 SSBO -> fp16 shared memory (direct copy)
+        for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? input_data[gm * in_dim + k_base + k] : float16_t(0.0);
+        }
+
+        // Load Gate and Up tiles: bf16 -> fp16 with clamping
+        for (uint i = tid; i < TILE_N * (TILE_K / 2); i += 256) {
+            uint n = i / (TILE_K / 2);
+            uint k2 = i % (TILE_K / 2);
+            uint gn = n_base + n;
+            if (gn < out_dim) {
+                uint idx = gn * (in_dim / 2) + k_base / 2 + k2;
+                uint g_packed = gate_data[idx];
+                uint u_packed = up_data[idx];
+                G_tile[n * B_STRIDE + k2 * 2] = bf16ToFp16(g_packed & 0xFFFFu);
+                G_tile[n * B_STRIDE + k2 * 2 + 1] = bf16ToFp16(g_packed >> 16);
+                U_tile[n * B_STRIDE + k2 * 2] = bf16ToFp16(u_packed & 0xFFFFu);
+                U_tile[n * B_STRIDE + k2 * 2 + 1] = bf16ToFp16(u_packed >> 16);
+            } else {
+                G_tile[n * B_STRIDE + k2 * 2] = float16_t(0.0);
+                G_tile[n * B_STRIDE + k2 * 2 + 1] = float16_t(0.0);
+                U_tile[n * B_STRIDE + k2 * 2] = float16_t(0.0);
+                U_tile[n * B_STRIDE + k2 * 2 + 1] = float16_t(0.0);
+            }
+        }
+
+        barrier();
+
+        // Compute outer products (f32 accumulation)
+        for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = float(A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k]);
+            }
+            for (uint j = 0; j < THREAD_N; j++) {
+                uint b_idx = (thread_n * THREAD_N + j) * B_STRIDE + k;
+                float g_val = float(G_tile[b_idx]);
+                float u_val = float(U_tile[b_idx]);
+                for (uint i = 0; i < THREAD_M; i++) {
+                    gate_acc[i * THREAD_N + j] += a_vals[i] * g_val;
+                    up_acc[i * THREAD_N + j] += a_vals[i] * u_val;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write: SiLU(gate) x up
+    for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                float gate = gate_acc[i * THREAD_N + j];
+                float silu = gate / (1.0 + exp(-gate));
+                output_data[gm * out_dim + gn] = float16_t(silu * up_acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}

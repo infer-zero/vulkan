@@ -1,0 +1,85 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+
+// Expert routing: expert_indices[expert_slot] gives the expert index
+layout(set = 1, binding = 0) buffer readonly ExpertIndices { uint expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint expert_slot;
+    uint expert_stride_u32; // per-expert stride in uint32 units (= out_dim * in_dim / 2 for BF16)
+};
+
+#define ROWS_PER_WG 8
+#define TILE_K 256
+
+shared float input_tile[TILE_K];
+shared float reduce_gate[256];
+shared float reduce_up[256];
+
+float bf16ToFloat(uint bits) {
+    return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_in_wg = tid / 32;
+    uint lane = tid & 31;
+    uint global_row = gl_WorkGroupID.x * ROWS_PER_WG + row_in_wg;
+
+    // Read expert index from routing buffer
+    uint expert_idx = expert_indices[expert_slot];
+    uint expert_base = expert_idx * expert_stride_u32;
+
+    float gate_sum = 0.0;
+    float up_sum = 0.0;
+    uint packed_base = expert_base + global_row * (in_dim / 2);
+    bool valid_row = global_row < out_dim;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        uint load_idx = tile_start + tid;
+        input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+        barrier();
+
+        if (valid_row) {
+            uint tile_end = min(TILE_K, in_dim - tile_start);
+            for (uint j = lane; j < tile_end / 2; j += 32) {
+                uint packed_idx = packed_base + tile_start / 2 + j;
+                uint g_packed = gate_data[packed_idx];
+                uint u_packed = up_data[packed_idx];
+                float in0 = input_tile[j * 2];
+                float in1 = input_tile[j * 2 + 1];
+                gate_sum += in0 * bf16ToFloat(g_packed & 0xFFFFu) + in1 * bf16ToFloat(g_packed >> 16);
+                up_sum += in0 * bf16ToFloat(u_packed & 0xFFFFu) + in1 * bf16ToFloat(u_packed >> 16);
+            }
+        }
+        barrier();
+    }
+
+    reduce_gate[tid] = gate_sum;
+    reduce_up[tid] = up_sum;
+    barrier();
+    if (lane < 16) { reduce_gate[tid] += reduce_gate[tid + 16]; reduce_up[tid] += reduce_up[tid + 16]; }
+    barrier();
+    if (lane < 8) { reduce_gate[tid] += reduce_gate[tid + 8]; reduce_up[tid] += reduce_up[tid + 8]; }
+    barrier();
+    if (lane < 4) { reduce_gate[tid] += reduce_gate[tid + 4]; reduce_up[tid] += reduce_up[tid + 4]; }
+    barrier();
+    if (lane < 2) { reduce_gate[tid] += reduce_gate[tid + 2]; reduce_up[tid] += reduce_up[tid + 2]; }
+    barrier();
+    if (lane < 1) { reduce_gate[tid] += reduce_gate[tid + 1]; reduce_up[tid] += reduce_up[tid + 1]; }
+
+    if (lane == 0 && valid_row) {
+        float gate = reduce_gate[tid];
+        float silu = gate / (1.0 + exp(-gate));
+        output_data[global_row] = float16_t(silu * reduce_up[tid]);
+    }
+}

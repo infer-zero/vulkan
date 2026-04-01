@@ -1,0 +1,331 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+// INT8 cooperative matrix GEMM with inter-workgroup K-split.
+// C[M,N] = A[M,K] x B^T[N,K], both Q8_0 format.
+// Uses KHR cooperative matrices with s8xs8->s32 (M=16, N=16, K=32).
+//
+// WG.x = n_panel * num_k_groups + k_group (flattened N x K-split)
+// WG.y = m_panel
+// Each WG processes its K-range, writes f32 partial sums to buffer.
+// Last WG per (m,n) tile does inline reduce and writes f16 output.
+
+#define TILE_M 128
+#define TILE_N 128
+#define TILE_K 32
+
+#define SG_ROWS 2
+#define SG_COLS 4
+#define SG_TILE_M 64
+#define SG_TILE_N 32
+
+#define PANEL_N 128
+#define Q8_BLOCK_SIZE 34
+
+#define mat_a_i8  coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+#define mat_b_i8  coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define mat_s32   coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define mat_f32   coopmat<float,   gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { int8_t input_data[]; };   // Q8_0 quantized activations
+layout(set = 0, binding = 1) buffer readonly Weights { int8_t weight_data[]; };
+layout(set = 0, binding = 2) buffer coherent PartialAndCounters { uint partial_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+    uint num_k_groups;
+    uint counter_offset;
+};
+
+// Shared memory for scales and writeback scratch
+shared float A_scales[TILE_M];            // 512 bytes
+shared float B_scales[TILE_N];            // 512 bytes
+shared float scratch[8 * 256];            // 8192 bytes
+shared uint shared_reduce_flag;
+// Total shared: ~9220 bytes -> up to 5 WGs/SM on Ampere (48KB limit)
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_lane = gl_SubgroupInvocationID;
+
+    // Unpack WG coordinates: x = n_panel * num_k_groups + k_group
+    uint wg_kn = gl_WorkGroupID.x;
+    uint k_group = wg_kn % num_k_groups;
+    uint wg_n = wg_kn / num_k_groups;
+    uint wg_m = gl_WorkGroupID.y;
+
+    uint sg_row = sg_id / SG_COLS;
+    uint sg_col = sg_id % SG_COLS;
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint sg_m_base = sg_row * SG_TILE_M;
+    uint sg_n_base = sg_col * SG_TILE_N;
+
+    uint num_blocks = in_dim / 32;
+    uint panel = n_base / PANEL_N;
+    uint panel_stride = num_blocks * PANEL_N * Q8_BLOCK_SIZE;
+    uint scale_section_size = num_blocks * PANEL_N * 2;
+
+    uint input_row_stride = num_blocks * Q8_BLOCK_SIZE;  // bytes per activation row
+
+    // K-range for this k_group
+    uint blocks_per_group = (num_blocks + num_k_groups - 1) / num_k_groups;
+    uint block_start = k_group * blocks_per_group;
+    uint block_end = min(block_start + blocks_per_group, num_blocks);
+
+    // ─── Precompute row/col index tables ───
+    uint soff = sg_id * 256;
+    mat_f32 row_idx, col_idx;
+
+    for (uint i = sg_lane; i < 256; i += 32)
+        scratch[soff + i] = float(i / 16);
+    subgroupMemoryBarrierShared();
+    coopMatLoad(row_idx, scratch, soff, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    for (uint i = sg_lane; i < 256; i += 32)
+        scratch[soff + i] = float(i % 16);
+    subgroupMemoryBarrierShared();
+    coopMatLoad(col_idx, scratch, soff, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    uint elem_count = row_idx.length();
+    uint r_tab[8], c_tab[8];
+    for (uint e = 0; e < elem_count; e++) {
+        r_tab[e] = uint(row_idx[e]);
+        c_tab[e] = uint(col_idx[e]);
+    }
+
+    // f32 accumulators: 4 M-rows x 2 N-cols = 8 sub-tiles per subgroup
+    mat_f32 acc00 = mat_f32(0.0), acc01 = mat_f32(0.0);
+    mat_f32 acc10 = mat_f32(0.0), acc11 = mat_f32(0.0);
+    mat_f32 acc20 = mat_f32(0.0), acc21 = mat_f32(0.0);
+    mat_f32 acc30 = mat_f32(0.0), acc31 = mat_f32(0.0);
+
+    // Global byte offsets for B weight data (panel-interleaved layout)
+    uint b_data_base = panel * panel_stride + scale_section_size;
+    uint b_scale_base = panel * panel_stride;
+
+    for (uint block_idx = block_start; block_idx < block_end; block_idx++) {
+        // ─── Load scales to shared memory ───
+        if (tid < TILE_M) {
+            uint gm = m_base + tid;
+            if (gm < batch_size) {
+                uint sb_a = gm * input_row_stride + block_idx * Q8_BLOCK_SIZE;
+                uint lo_a = uint(input_data[sb_a]) & 0xFFu;
+                uint hi_a = uint(input_data[sb_a + 1]) & 0xFFu;
+                A_scales[tid] = unpackHalf2x16(lo_a | (hi_a << 8u)).x;
+            } else {
+                A_scales[tid] = 0.0;
+            }
+        }
+        if (tid < TILE_N) {
+            uint gn = n_base + tid;
+            if (gn < out_dim) {
+                uint sb_b = b_scale_base + block_idx * PANEL_N * 2 + tid * 2;
+                uint lo_b = uint(weight_data[sb_b]) & 0xFFu;
+                uint hi_b = uint(weight_data[sb_b + 1]) & 0xFFu;
+                B_scales[tid] = unpackHalf2x16(lo_b | (hi_b << 8u)).x;
+            } else {
+                B_scales[tid] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // ─── Cache scales in registers ───
+        float a_sc[4][8], b_sc[2][8];
+        for (uint e = 0; e < elem_count; e++) {
+            a_sc[0][e] = A_scales[sg_m_base + 0 + r_tab[e]];
+            a_sc[1][e] = A_scales[sg_m_base + 16 + r_tab[e]];
+            a_sc[2][e] = A_scales[sg_m_base + 32 + r_tab[e]];
+            a_sc[3][e] = A_scales[sg_m_base + 48 + r_tab[e]];
+            b_sc[0][e] = B_scales[sg_n_base + 0 + c_tab[e]];
+            b_sc[1][e] = B_scales[sg_n_base + 16 + c_tab[e]];
+        }
+
+        // ─── Direct global coopMatLoad + INT8 matmul ───
+        mat_a_i8 a_i8;
+        mat_b_i8 b0_i8, b1_i8;
+        mat_s32 s32_zero = mat_s32(0), s32_result;
+
+        uint b_block_off = b_data_base + block_idx * PANEL_N * 32;
+        coopMatLoad(b0_i8, weight_data, b_block_off + (sg_n_base + 0) * 32, 32, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b1_i8, weight_data, b_block_off + (sg_n_base + 16) * 32, 32, gl_CooperativeMatrixLayoutColumnMajor);
+
+        uint a_row0 = m_base + sg_m_base;
+
+        // M-row 0
+        coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc00[e] += float(s32_result[e]) * a_sc[0][e] * b_sc[0][e];
+        s32_result = coopMatMulAdd(a_i8, b1_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc01[e] += float(s32_result[e]) * a_sc[0][e] * b_sc[1][e];
+
+        // M-row 1
+        coopMatLoad(a_i8, input_data, (a_row0 + 16) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc10[e] += float(s32_result[e]) * a_sc[1][e] * b_sc[0][e];
+        s32_result = coopMatMulAdd(a_i8, b1_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc11[e] += float(s32_result[e]) * a_sc[1][e] * b_sc[1][e];
+
+        // M-row 2
+        coopMatLoad(a_i8, input_data, (a_row0 + 32) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc20[e] += float(s32_result[e]) * a_sc[2][e] * b_sc[0][e];
+        s32_result = coopMatMulAdd(a_i8, b1_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc21[e] += float(s32_result[e]) * a_sc[2][e] * b_sc[1][e];
+
+        // M-row 3
+        coopMatLoad(a_i8, input_data, (a_row0 + 48) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc30[e] += float(s32_result[e]) * a_sc[3][e] * b_sc[0][e];
+        s32_result = coopMatMulAdd(a_i8, b1_i8, s32_zero);
+        for (uint e = 0; e < elem_count; e++)
+            acc31[e] += float(s32_result[e]) * a_sc[3][e] * b_sc[1][e];
+
+        barrier();
+    }
+
+    // ─── Write partial sums to buffer via scratch ───
+    uint out_m = m_base + sg_m_base;
+    uint out_n = n_base + sg_n_base;
+
+    uint sb = sg_id * 256;
+    uint num_n_panels = (out_dim + 127) / 128;
+
+    // Helper macro-like: store coop mat to scratch, then write f32 to partial_data
+    // partial_data layout: partial_data[(k_group * batch_size + gm) * out_dim + gn]
+
+    // acc00: rows [out_m..out_m+16), cols [out_n..out_n+16)
+    coopMatStore(acc00, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + i / 16;
+        uint gn = out_n + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc01, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + i / 16;
+        uint gn = out_n + 16 + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc10, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 16 + i / 16;
+        uint gn = out_n + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc11, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 16 + i / 16;
+        uint gn = out_n + 16 + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc20, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 32 + i / 16;
+        uint gn = out_n + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc21, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 32 + i / 16;
+        uint gn = out_n + 16 + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc30, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 48 + i / 16;
+        uint gn = out_n + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    coopMatStore(acc31, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = sg_lane; i < 256; i += 32) {
+        uint gm = out_m + 48 + i / 16;
+        uint gn = out_n + 16 + i % 16;
+        if (gm < batch_size && gn < out_dim)
+            partial_data[(k_group * batch_size + gm) * out_dim + gn] = floatBitsToUint(scratch[sb + i]);
+    }
+
+    // Ensure partial sums are globally visible
+    memoryBarrierBuffer();
+    barrier();
+
+    // Atomic counter: one per (wg_m, wg_n) tile
+    uint counter_idx = counter_offset + wg_m * num_n_panels + wg_n;
+
+    if (tid == 0u) {
+        uint old = atomicAdd(partial_data[counter_idx], 1u);
+        shared_reduce_flag = (old == num_k_groups - 1u) ? 1u : 0u;
+    }
+    barrier();
+
+    // Last k_group: reduce all partial sums and write f16 output
+    if (shared_reduce_flag == 1u) {
+        memoryBarrierBuffer();
+
+        // Each thread reduces a subset of the tile's elements
+        // Tile covers [m_base..m_base+TILE_M) x [n_base..n_base+TILE_N)
+        // Total elements = TILE_M * TILE_N = 16384, threads = 256 -> 64 elements each
+        for (uint idx = tid; idx < TILE_M * TILE_N; idx += 256) {
+            uint lm = idx / TILE_N;
+            uint ln = idx % TILE_N;
+            uint gm = m_base + lm;
+            uint gn = n_base + ln;
+            if (gm < batch_size && gn < out_dim) {
+                float final_sum = 0.0;
+                for (uint kg = 0; kg < num_k_groups; kg++) {
+                    final_sum += uintBitsToFloat(partial_data[(kg * batch_size + gm) * out_dim + gn]);
+                }
+                output_data[gm * out_dim + gn] = float16_t(final_sum);
+            }
+        }
+
+        // Reset counter
+        if (tid == 0u) {
+            partial_data[counter_idx] = 0u;
+        }
+    }
+}

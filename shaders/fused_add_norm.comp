@@ -1,0 +1,64 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Fused: add_vectors + cmdCopy(state->residual) + rms_norm
+// When apply_add=1: state = norm((state + residual) * weights), residual = state + residual
+// When apply_add=0: state = norm(state * weights), residual = state  (just copy + norm)
+//
+// Single workgroup (256 threads) processes entire dim via strided loop.
+// This eliminates 2 dispatches + 1 copy + 2-3 barriers per invocation.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer State { float16_t state[]; };
+layout(set = 0, binding = 1) buffer Residual { float16_t residual[]; };
+layout(set = 0, binding = 2) buffer readonly Weights { float weights[]; };
+
+layout(push_constant) uniform Params {
+    uint dim;
+    float epsilon;
+    uint apply_add;
+#ifdef RESIDUAL_SCALE
+    float residual_scale;
+#endif
+};
+
+shared float shared_sum[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+    // Phase 1: optionally add residual, save to residual, compute sum of squares
+    float partial = 0.0;
+    for (uint i = tid; i < dim; i += wg_size) {
+        float s = float(state[i]);
+        if (apply_add != 0) {
+#ifdef RESIDUAL_SCALE
+            s = s * residual_scale + float(residual[i]);
+#else
+            s += float(residual[i]);
+#endif
+        }
+        // Save combined value as new residual
+        residual[i] = float16_t(s);
+        partial += s * s;
+    }
+    shared_sum[tid] = partial;
+    barrier();
+
+    // Reduction in shared memory
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+
+    // Phase 2: normalize and scale (read from residual which has the summed value)
+    for (uint i = tid; i < dim; i += wg_size) {
+        state[i] = float16_t(float(residual[i]) * inv_rms * weights[i]);
+    }
+}

@@ -1,0 +1,49 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer State { float16_t state[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { float weights[]; };
+
+layout(push_constant) uniform Params {
+    uint dim;
+    float epsilon;
+};
+
+shared float shared_sum[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+#ifdef BATCH_MODE
+    uint base = gl_WorkGroupID.x * dim;
+#else
+    uint base = 0;
+#endif
+
+    // Phase 1: compute partial sum of squares
+    float partial = 0.0;
+    for (uint i = tid; i < dim; i += wg_size) {
+        float v = float(state[base + i]);
+        partial += v * v;
+    }
+    shared_sum[tid] = partial;
+    barrier();
+
+    // Reduction in shared memory
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+
+    // Phase 2: scale
+    for (uint i = tid; i < dim; i += wg_size) {
+        state[base + i] = float16_t(float(state[base + i]) * inv_rms * weights[i]);
+    }
+}

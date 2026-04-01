@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Pre-quantize F16 activations to int8 packed format for IDP GEMM.
+// Output layout per Q8 block (9 uint32):
+//   [0]: float scale (as uint via floatBitsToUint)
+//   [1..8]: 8 x packed int8x4 (32 int8 values total)
+// Buffer layout: quant[row * num_blocks * 9 + block * 9 + ...]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer writeonly Output { uint quant_data[]; };
+
+layout(push_constant) uniform Params {
+    uint dim;
+    uint batch_size;
+};
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (row >= batch_size) return;
+
+    uint num_blocks = dim / 32;
+
+    for (uint block = tid; block < num_blocks; block += 256) {
+        uint k_base = block * 32;
+
+        // Find max_abs of 32 values
+        float max_abs = 0.0;
+        for (uint k = 0; k < 32; k++) {
+            max_abs = max(max_abs, abs(float(input_data[row * dim + k_base + k])));
+        }
+
+        float scale = max_abs / 127.0;
+        float inv_scale = (max_abs > 0.0) ? 127.0 / max_abs : 0.0;
+
+        uint base_out = row * num_blocks * 9 + block * 9;
+        quant_data[base_out] = floatBitsToUint(scale);
+
+        for (uint k = 0; k < 8; k++) {
+            uint bk = k_base + k * 4;
+            int v0 = int(round(float(input_data[row * dim + bk + 0]) * inv_scale));
+            int v1 = int(round(float(input_data[row * dim + bk + 1]) * inv_scale));
+            int v2 = int(round(float(input_data[row * dim + bk + 2]) * inv_scale));
+            int v3 = int(round(float(input_data[row * dim + bk + 3]) * inv_scale));
+            quant_data[base_out + 1 + k] = uint((v0 & 0xFF) | ((v1 & 0xFF) << 8) | ((v2 & 0xFF) << 16) | ((v3 & 0xFF) << 24));
+        }
+    }
+}

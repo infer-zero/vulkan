@@ -1,0 +1,72 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+#define ROWS_PER_WG 8
+#define TILE_K 256
+
+shared float input_tile[TILE_K];
+shared float reduce[256];
+
+float bf16ToFloat(uint bits) {
+    return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row_in_wg = tid / 32;
+    uint lane = tid & 31;
+    uint global_row = gl_WorkGroupID.x * ROWS_PER_WG + row_in_wg;
+
+    float sum = 0.0;
+    uint packed_base = global_row * (in_dim / 2);
+    bool valid_row = global_row < out_dim;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        // Cooperatively load 256 input elements into shared memory (coalesced)
+        uint load_idx = tile_start + tid;
+        input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+        barrier();
+
+        // Each warp processes packed bf16 pairs (2 weights per uint32)
+        if (valid_row) {
+            uint tile_end = min(TILE_K, in_dim - tile_start);
+            for (uint j = lane; j < tile_end / 2; j += 32) {
+                uint packed = weight_data[packed_base + tile_start / 2 + j];
+                float w0 = bf16ToFloat(packed & 0xFFFFu);
+                float w1 = bf16ToFloat(packed >> 16);
+                sum += input_tile[j * 2] * w0;
+                sum += input_tile[j * 2 + 1] * w1;
+            }
+        }
+        barrier();
+    }
+
+    // Parallel reduction: 32 threads per row -> 1 result
+    reduce[tid] = sum;
+    barrier();
+    if (lane < 16) reduce[tid] += reduce[tid + 16];
+    barrier();
+    if (lane < 8) reduce[tid] += reduce[tid + 8];
+    barrier();
+    if (lane < 4) reduce[tid] += reduce[tid + 4];
+    barrier();
+    if (lane < 2) reduce[tid] += reduce[tid + 2];
+    barrier();
+    if (lane < 1) reduce[tid] += reduce[tid + 1];
+
+    if (lane == 0 && valid_row) {
+        output_data[global_row] = float16_t(reduce[tid]);
+    }
+}

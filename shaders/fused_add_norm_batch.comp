@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Batch version of fused_add_norm for prefill.
+// One workgroup per token (gl_WorkGroupID.x = batch index).
+// When apply_add=1: state = norm((state + residual) * weights), residual = state + residual
+// When apply_add=0: state = norm(state * weights), residual = state
+// Eliminates cmdCopyBuffer + add_vectors + rms_norm per batch row.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer State { float16_t state[]; };
+layout(set = 0, binding = 1) buffer Residual { float16_t residual[]; };
+layout(set = 0, binding = 2) buffer readonly Weights { float weights[]; };
+
+layout(push_constant) uniform Params {
+    uint dim;
+    float epsilon;
+    uint apply_add;
+#ifdef RESIDUAL_SCALE
+    float residual_scale;
+#endif
+};
+
+shared float shared_sum[256];
+
+void main() {
+    uint batch_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+    uint base = batch_idx * dim;
+
+    // Phase 1: optionally add residual, save to residual, compute sum of squares
+    float partial = 0.0;
+    for (uint i = tid; i < dim; i += wg_size) {
+        float s = float(state[base + i]);
+        if (apply_add != 0) {
+#ifdef RESIDUAL_SCALE
+            s = s * residual_scale + float(residual[base + i]);
+#else
+            s += float(residual[base + i]);
+#endif
+        }
+        residual[base + i] = float16_t(s);
+        float s_r = float(residual[base + i]);
+        partial += s_r * s_r;
+    }
+    shared_sum[tid] = partial;
+    barrier();
+
+    // Reduction in shared memory
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+
+    // Phase 2: normalize and scale
+    for (uint i = tid; i < dim; i += wg_size) {
+        state[base + i] = float16_t(float(residual[base + i]) * inv_rms * weights[i]);
+    }
+}

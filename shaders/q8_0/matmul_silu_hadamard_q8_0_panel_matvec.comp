@@ -1,0 +1,143 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused gate+up matvec with SiLU+Hadamard: panel-interleaved Q8_0, 128 threads, 2 rows/WG.
+// Computes: output[i] = silu(gate[i]) * up[i]
+// Both gate and up weight buffers use panel-interleaved layout.
+// 4buf: input, gate_weights, up_weights, output
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_weight_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_weight_data[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+};
+
+#define NUM_ROWS 2
+#define PANEL_N 128
+#define Q8_BLOCK_SIZE 34
+
+shared float gate_sh[NUM_ROWS][4];
+shared float up_sh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * NUM_ROWS;
+
+    uint num_blocks = in_dim / 32;
+    uint panel_stride_u32 = num_blocks * PANEL_N * Q8_BLOCK_SIZE / 4;
+    uint scale_section_u32 = num_blocks * PANEL_N / 2;
+    uint sub_offset_bytes = (tid * 8) & 31;
+
+    uint panel_base_u32[NUM_ROWS];
+    uint scale_off_u32[NUM_ROWS];
+    uint data_base_u32[NUM_ROWS];
+    uint scale_shift[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        uint row = first_row + n;
+        uint panel = row / PANEL_N;
+        uint col_in_panel = row % PANEL_N;
+        panel_base_u32[n] = panel * panel_stride_u32;
+        uint scale_byte = col_in_panel * 2;
+        scale_off_u32[n] = scale_byte >> 2;
+        scale_shift[n] = (scale_byte & 2u) * 8u;
+        data_base_u32[n] = panel_base_u32[n] + scale_section_u32 + (col_in_panel * 32 + sub_offset_bytes) / 4;
+    }
+
+    uint scale_stride_u32 = PANEL_N / 2;
+    uint data_stride_u32 = PANEL_N * 32 / 4;
+
+    float gate_temp[NUM_ROWS];
+    float up_temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        gate_temp[n] = 0.0;
+        up_temp[n] = 0.0;
+    }
+
+    uint input_base = tid * 4;
+    uint block_idx = (tid * 8) / 32;
+
+    for (uint col = tid * 8; col < in_dim; col += 1024) {
+        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
+        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
+        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
+        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
+        input_base += 512;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row >= out_dim) break;
+
+            uint si = panel_base_u32[n] + scale_off_u32[n] + block_idx * scale_stride_u32;
+            uint di = data_base_u32[n] + block_idx * data_stride_u32;
+
+            // Gate weight
+            float g_scale = unpackHalf2x16((gate_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+            uint gw0 = gate_weight_data[di];
+            uint gw1 = gate_weight_data[di + 1];
+
+            float g_dot =
+                b01.x * float(bitfieldExtract(int(gw0), 0, 8)) +
+                b01.y * float(bitfieldExtract(int(gw0), 8, 8)) +
+                b23.x * float(bitfieldExtract(int(gw0), 16, 8)) +
+                b23.y * float(bitfieldExtract(int(gw0), 24, 8)) +
+                b45.x * float(bitfieldExtract(int(gw1), 0, 8)) +
+                b45.y * float(bitfieldExtract(int(gw1), 8, 8)) +
+                b67.x * float(bitfieldExtract(int(gw1), 16, 8)) +
+                b67.y * float(bitfieldExtract(int(gw1), 24, 8));
+
+            gate_temp[n] += g_scale * g_dot;
+
+            // Up weight
+            float u_scale = unpackHalf2x16((up_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+            uint uw0 = up_weight_data[di];
+            uint uw1 = up_weight_data[di + 1];
+
+            float u_dot =
+                b01.x * float(bitfieldExtract(int(uw0), 0, 8)) +
+                b01.y * float(bitfieldExtract(int(uw0), 8, 8)) +
+                b23.x * float(bitfieldExtract(int(uw0), 16, 8)) +
+                b23.y * float(bitfieldExtract(int(uw0), 24, 8)) +
+                b45.x * float(bitfieldExtract(int(uw1), 0, 8)) +
+                b45.y * float(bitfieldExtract(int(uw1), 8, 8)) +
+                b67.x * float(bitfieldExtract(int(uw1), 16, 8)) +
+                b67.y * float(bitfieldExtract(int(uw1), 24, 8));
+
+            up_temp[n] += u_scale * u_dot;
+        }
+        block_idx += 32;
+    }
+
+    // Reduce
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        gate_temp[n] = subgroupAdd(gate_temp[n]);
+        up_temp[n] = subgroupAdd(up_temp[n]);
+    }
+
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            gate_sh[n][gl_SubgroupID] = gate_temp[n];
+            up_sh[n][gl_SubgroupID] = up_temp[n];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row < out_dim) {
+                float g = gate_sh[n][0] + gate_sh[n][1] + gate_sh[n][2] + gate_sh[n][3];
+                float u = up_sh[n][0] + up_sh[n][1] + up_sh[n][2] + up_sh[n][3];
+                float silu_g = g / (1.0 + exp(-g));
+                output_data[row] = float16_t(silu_g * u);
+            }
+        }
+    }
+}

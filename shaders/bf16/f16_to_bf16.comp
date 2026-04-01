@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
+layout(set = 0, binding = 1) buffer Dst { uint dst_data[]; };
+
+#ifdef BATCH_MODE
+layout(push_constant) uniform Params {
+    uint count;          // number of elements per batch item (must be even)
+    uint start_position;
+};
+#else
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+
+layout(push_constant) uniform Params {
+    uint count;          // number of elements (must be even)
+};
+#endif
+
+// Packs 2 BF16 values into one uint32: low 16 bits = even element, high 16 bits = odd element
+void main() {
+    uint pair_idx = gl_GlobalInvocationID.x;
+    uint pair_count = count / 2;
+    if (pair_idx >= pair_count) return;
+
+#ifdef BATCH_MODE
+    uint batch_idx = gl_WorkGroupID.y;
+    uint src_base = batch_idx * count + pair_idx * 2;
+    uint dst_base = (start_position + batch_idx) * pair_count + pair_idx;
+#else
+    uint src_base = pair_idx * 2;
+    uint dst_base = dyn_position * pair_count + pair_idx;
+#endif
+
+    uint bits0 = floatBitsToUint(float(src_data[src_base]));
+    uint bits1 = floatBitsToUint(float(src_data[src_base + 1]));
+
+    dst_data[dst_base] = (bits0 >> 16) | (bits1 & 0xFFFF0000u);
+}

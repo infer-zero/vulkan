@@ -1,0 +1,210 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : require
+#ifdef IDP_MODE
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+// Tiled GEMM: C[M,N] = A[M,K] x B^T[N,K]
+// B = weight matrix (Q8_0 panel-interleaved, [N x K/32 blocks])
+// C = output activations (f16, row-major [M x N])
+// M = batch_size, N = out_dim, K = in_dim
+//
+// Variants (via preprocessor defines):
+//   (none)     -> A is f16 activations, dequant B to float, outer-product accumulation
+//   IDP_MODE   -> A is pre-quantized (packed int8 + scale), B stays packed, dotPacked4x8EXT
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 32       // Matches Q8_0 block size
+#define WG_M 8          // threads in M direction
+#define WG_N 32         // threads in N direction (WG_M x WG_N = 256)
+#define THREAD_M 8      // TILE_M / WG_M
+#define THREAD_N 4      // TILE_N / WG_N
+#define PANEL_N 128
+#define Q8_BLOCK_SIZE 34
+
+#ifndef IDP_MODE
+#define A_STRIDE 33     // TILE_K + 1 for bank conflict avoidance
+#define B_STRIDE 33
+#endif
+
+layout(local_size_x = 256) in;
+
+#ifdef IDP_MODE
+layout(set = 0, binding = 0) buffer readonly QuantInput { uint quant_data[]; };
+#else
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+#endif
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+#ifdef IDP_MODE
+shared int A_packed[TILE_M * 8];
+shared float A_scale[TILE_M];
+shared int B_packed[TILE_N * 8];
+shared float B_scale[TILE_N];
+#else
+shared float A_tile[TILE_M * A_STRIDE];   // 64 x 33 = 8.4 KB
+shared float B_tile[TILE_N * B_STRIDE];   // 128 x 33 = 16.9 KB
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;   // output tile index (N direction)
+    uint wg_m = gl_WorkGroupID.y;   // batch tile index (M direction)
+
+    uint thread_m = tid / WG_N;     // 0..7
+    uint thread_n = tid % WG_N;     // 0..31
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint num_blocks = in_dim / 32;
+    uint panel = n_base / PANEL_N;
+    uint panel_stride = num_blocks * PANEL_N * Q8_BLOCK_SIZE;
+    uint scale_section_size = num_blocks * PANEL_N * 2;
+
+    // Accumulators: THREAD_M x THREAD_N = 8 x 4 = 32
+    float acc[THREAD_M * THREAD_N];
+    [[unroll]] for (uint i = 0; i < THREAD_M * THREAD_N; i++) acc[i] = 0.0;
+
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+
+#ifdef IDP_MODE
+        // --- Load A tile from pre-quantized buffer (threads 0-63) ---
+        if (tid < TILE_M) {
+            uint gm = m_base + tid;
+            if (gm < batch_size) {
+                uint base_q = gm * num_blocks * 9 + block_idx * 9;
+                A_scale[tid] = uintBitsToFloat(quant_data[base_q]);
+                [[unroll]] for (uint k = 0; k < 8; k++) {
+                    A_packed[tid * 8 + k] = int(quant_data[base_q + 1 + k]);
+                }
+            } else {
+                A_scale[tid] = 0.0;
+                [[unroll]] for (uint k = 0; k < 8; k++) A_packed[tid * 8 + k] = 0;
+            }
+        }
+
+        // --- Load B tile (threads 0-127): keep as packed int ---
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint scale_byte = panel * panel_stride + block_idx * PANEL_N * 2 + col * 2;
+                uint data_byte = panel * panel_stride + scale_section_size + block_idx * PANEL_N * 32 + col * 32;
+
+                uint scale_word = weight_data[scale_byte >> 2];
+                B_scale[col] = unpackHalf2x16((scale_word >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+
+                uint base_word = data_byte >> 2;
+                [[unroll]] for (uint k = 0; k < 8; k++) {
+                    B_packed[col * 8 + k] = int(weight_data[base_word + k]);
+                }
+            } else {
+                B_scale[col] = 0.0;
+                [[unroll]] for (uint k = 0; k < 8; k++) B_packed[col * 8 + k] = 0;
+            }
+        }
+#else
+        uint k_base = block_idx * 32;
+
+        // Load A tile: TILE_M x TILE_K = 64 x 32 = 2048 elements, 256 threads -> 8 each
+        [[unroll]] for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+        }
+
+        // Load B tile: 128 threads each dequantize one Q8_0 block
+        // Vectorized: read uint words directly instead of individual readInt8 calls
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint scale_byte = panel * panel_stride + block_idx * PANEL_N * 2 + col * 2;
+                uint data_byte = panel * panel_stride + scale_section_size + block_idx * PANEL_N * 32 + col * 32;
+
+                uint scale_word = weight_data[scale_byte >> 2];
+                float scale = unpackHalf2x16((scale_word >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+
+                uint base_word = data_byte >> 2;
+                [[unroll]] for (uint k = 0; k < 8; k++) {
+                    uint packed = weight_data[base_word + k];
+                    uint base_k = k * 4;
+                    B_tile[col * B_STRIDE + base_k + 0] = scale * float(bitfieldExtract(int(packed), 0, 8));
+                    B_tile[col * B_STRIDE + base_k + 1] = scale * float(bitfieldExtract(int(packed), 8, 8));
+                    B_tile[col * B_STRIDE + base_k + 2] = scale * float(bitfieldExtract(int(packed), 16, 8));
+                    B_tile[col * B_STRIDE + base_k + 3] = scale * float(bitfieldExtract(int(packed), 24, 8));
+                }
+            } else {
+                [[unroll]] for (uint k = 0; k < 32; k++) {
+                    B_tile[col * B_STRIDE + k] = 0.0;
+                }
+            }
+        }
+#endif
+
+        barrier();
+
+#ifdef IDP_MODE
+        // --- Compute using dotPacked4x8EXT ---
+        [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+            uint m = thread_m * THREAD_M + i;
+            float a_sc = A_scale[m];
+
+            [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                uint n = thread_n * THREAD_N + j;
+
+                int q_sum = 0;
+                [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+                    q_sum += dotPacked4x8EXT(A_packed[m * 8 + iqs], B_packed[n * 8 + iqs]);
+                }
+
+                acc[i * THREAD_N + j] += float(q_sum) * a_sc * B_scale[n];
+            }
+        }
+#else
+        // Compute outer products over the K tile
+        [[unroll]] for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k];
+            }
+            float b_vals[THREAD_N];
+            [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                b_vals[j] = B_tile[(thread_n * THREAD_N + j) * B_STRIDE + k];
+            }
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                    acc[i * THREAD_N + j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+#endif
+
+        barrier();
+    }
+
+    // Write results
+    [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                output_data[gm * out_dim + gn] = float16_t(acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}

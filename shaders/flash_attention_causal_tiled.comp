@@ -1,0 +1,155 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Query-tiled flash attention for batched prefill.
+// 256 threads = 8 warps of 32. One workgroup processes TILE_Q=8 consecutive query tokens.
+// All 8 warps cooperatively load KV tiles into shared memory, then each warp
+// computes attention for its query token from shared memory.
+// KV bandwidth reduced ~8x vs non-tiled version.
+// KV cache uses packed BF16: 2 values per uint32.
+//
+// Supports head_dim=64 and head_dim=128 via dim_passes loop.
+// Each lane handles 2 dims per pass (32 lanes × 2 = 64 dims per pass).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
+layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint kv_dim;
+    uint num_heads;
+    uint queries_per_kv;
+    uint start_position;
+    uint batch_size;
+    float scale;
+    uint capacity;
+    float rope_theta;
+};
+
+#define TILE_Q 8
+#define TILE_KV 64
+#define WARP_SIZE 32
+
+// Shared memory for KV tiles: [TILE_KV x 64] packed uint32 each (max head_dim=128, 64 packed pairs)
+shared uint k_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
+shared uint v_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
+
+// Unpack 2 BF16 values from a packed uint32
+void unpackBf16Pair(uint packed, out float v0, out float v1) {
+    v0 = uintBitsToFloat((packed & 0xFFFFu) << 16);
+    v1 = uintBitsToFloat(packed & 0xFFFF0000u);
+}
+
+void main() {
+    uint wg_id = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;   // 0..7 -> which query in tile
+    uint lane = tid % WARP_SIZE;      // 0..31 -> which 2 dims
+
+    uint tile_idx = wg_id / num_heads;
+    uint head = wg_id % num_heads;
+
+    uint query_idx = tile_idx * TILE_Q + warp_id;
+    uint kv_head = head / queries_per_kv;
+
+    // Causal bound for this warp's query
+    uint count = (query_idx < batch_size) ? (start_position + query_idx + 1) : 0;
+
+    // Max count across all queries in this tile (for cooperative KV loading)
+    uint last_query = min(tile_idx * TILE_Q + TILE_Q - 1, batch_size - 1);
+    uint max_count = start_position + last_query + 1;
+
+    // Number of 64-dim passes (1 for hd=64, 2 for hd=128)
+    uint dim_passes = head_dim / 64;
+    uint packed_head_dim = head_dim / 2;  // packed uint32s per head
+
+    // Load query into registers
+    float rq[4];
+    for (uint pass = 0; pass < dim_passes; pass++) {
+        uint d0 = pass * 64 + lane * 2;
+        if (query_idx < batch_size) {
+            uint q_base = query_idx * num_heads * head_dim + head * head_dim;
+            rq[pass * 2]     = float(query_data[q_base + d0]);
+            rq[pass * 2 + 1] = float(query_data[q_base + d0 + 1]);
+        } else {
+            rq[pass * 2]     = 0.0;
+            rq[pass * 2 + 1] = 0.0;
+        }
+    }
+
+    // Online softmax state
+    float m = -1.0 / 0.0;
+    float l = 0.0;
+    float ov[4];
+    for (uint i = 0; i < dim_passes * 2; i++) ov[i] = 0.0;
+
+    uint kv_base = kv_head * head_dim;
+    uint packed_kv_stride = kv_dim / 2;
+    uint packed_kv_base = kv_base / 2;
+
+    // Process KV in tiles of TILE_KV positions
+    for (uint tile_start = 0; tile_start < max_count; tile_start += TILE_KV) {
+        uint tile_end = min(tile_start + TILE_KV, max_count);
+        uint tile_len = tile_end - tile_start;
+
+        // Cooperative load: 256 threads load tile_len x packed_head_dim elements for K and V
+        for (uint i = tid; i < tile_len * packed_head_dim; i += 256) {
+            uint pos_in_tile = i / packed_head_dim;
+            uint dim_idx = i % packed_head_dim;
+            uint global_pos = tile_start + pos_in_tile;
+            uint packed_off = global_pos * packed_kv_stride + packed_kv_base;
+            k_tile[pos_in_tile * packed_head_dim + dim_idx] = k_cache[packed_off + dim_idx];
+            v_tile[pos_in_tile * packed_head_dim + dim_idx] = v_cache[packed_off + dim_idx];
+        }
+        barrier();
+
+        // Each warp computes attention for its query from shared memory
+        uint warp_tile_end = min(tile_end, count);
+        for (uint pos = tile_start; pos < warp_tile_end; pos++) {
+            uint pos_in_tile = pos - tile_start;
+
+            // Q*K dot product from shared memory across all passes
+            float dot_accum = 0.0;
+            for (uint pass = 0; pass < dim_passes; pass++) {
+                float k0, k1;
+                unpackBf16Pair(k_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], k0, k1);
+                dot_accum += rq[pass * 2] * k0 + rq[pass * 2 + 1] * k1;
+            }
+            float dot = subgroupAdd(dot_accum) * scale;
+
+            // Online softmax update
+            float new_m = max(m, dot);
+            float correction = exp(m - new_m);
+            float p = exp(dot - new_m);
+            l = l * correction + p;
+
+            // Rescale accumulators and add V contribution from shared memory
+            for (uint pass = 0; pass < dim_passes; pass++) {
+                float v0, v1;
+                unpackBf16Pair(v_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], v0, v1);
+                ov[pass * 2]     = ov[pass * 2]     * correction + p * v0;
+                ov[pass * 2 + 1] = ov[pass * 2 + 1] * correction + p * v1;
+            }
+
+            m = new_m;
+        }
+        barrier();
+    }
+
+    // Normalize and write output
+    if (query_idx < batch_size) {
+        uint out_base = query_idx * num_heads * head_dim + head * head_dim;
+        float inv_l = 1.0 / l;
+        for (uint pass = 0; pass < dim_passes; pass++) {
+            uint d0 = pass * 64 + lane * 2;
+            output_data[out_base + d0]     = float16_t(ov[pass * 2]     * inv_l);
+            output_data[out_base + d0 + 1] = float16_t(ov[pass * 2 + 1] * inv_l);
+        }
+    }
+}

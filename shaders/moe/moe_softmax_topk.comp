@@ -1,0 +1,133 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly RouterLogits { float router_logits[]; };
+layout(set = 0, binding = 1) buffer ExpertIndices { uint expert_indices[]; };
+layout(set = 0, binding = 2) buffer ExpertWeights { float expert_weights[]; };
+#ifdef HAS_BIAS
+layout(set = 0, binding = 3) buffer readonly ExpertBias { float expert_bias[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    uint num_experts;
+    uint k;
+    uint norm_topk_prob;
+#ifdef SIGMOID_GATING
+    uint gating_func; // 0 = softmax, >= 1 = sigmoid
+#endif
+#ifdef HAS_BIAS
+    uint has_bias;    // 0 = no bias, 1 = add expert_bias before gating
+#endif
+};
+
+shared float logits[256]; // max 256 experts
+shared uint indices[16];  // max 16 top-k
+shared float weights[16]; // max 16 top-k
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Load logits into shared memory
+    float val;
+    if (tid < num_experts) {
+        val = router_logits[tid];
+#ifdef HAS_BIAS
+        if (has_bias != 0) val += expert_bias[tid];
+#endif
+    } else {
+        val = -1.0/0.0; // -inf
+    }
+    logits[tid] = val;
+    barrier();
+
+#ifdef SIGMOID_GATING
+    if (gating_func == 0) {
+#endif
+        // Softmax gating
+
+        // Find max (parallel reduction)
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (tid < stride && tid + stride < 256) {
+                logits[tid] = max(logits[tid], logits[tid + stride]);
+            }
+            barrier();
+        }
+        float max_val = logits[0];
+        barrier();
+
+        // Compute exp(x - max) and store back
+        val = (tid < num_experts) ? exp(val - max_val) : 0.0;
+        logits[tid] = val;
+        barrier();
+
+        // Sum (parallel reduction)
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (tid < stride && tid + stride < 256) {
+                logits[tid] += logits[tid + stride];
+            }
+            barrier();
+        }
+        float sum_exp = logits[0];
+        barrier();
+
+        // Normalize
+        float prob = (tid < num_experts) ? val / sum_exp : 0.0;
+        logits[tid] = prob;
+        barrier();
+#ifdef SIGMOID_GATING
+    } else {
+        // Sigmoid gating
+        float prob = (tid < num_experts) ? 1.0 / (1.0 + exp(-val)) : 0.0;
+        logits[tid] = prob;
+        barrier();
+    }
+#endif
+
+    // Top-k selection (sequential, thread 0 only)
+    if (tid == 0) {
+        for (uint rank = 0; rank < k; rank++) {
+            float best_val = -1.0;
+            uint best_idx = 0;
+
+            for (uint e = 0; e < num_experts; e++) {
+                float v = logits[e];
+                if (v > best_val) {
+                    // Check not already selected
+                    bool already = false;
+                    for (uint prev = 0; prev < rank; prev++) {
+                        if (indices[prev] == e) { already = true; break; }
+                    }
+                    if (!already) {
+                        best_val = v;
+                        best_idx = e;
+                    }
+                }
+            }
+
+            indices[rank] = best_idx;
+            weights[rank] = best_val;
+        }
+
+        // Renormalize if requested
+#ifdef SIGMOID_GATING
+        // Always renormalize for sigmoid gating
+        if (norm_topk_prob != 0 || gating_func >= 1) {
+#else
+        if (norm_topk_prob != 0) {
+#endif
+            float wsum = 0.0;
+            for (uint i = 0; i < k; i++) wsum += weights[i];
+            if (wsum > 0.0) {
+                float inv = 1.0 / wsum;
+                for (uint i = 0; i < k; i++) weights[i] *= inv;
+            }
+        }
+
+        // Write outputs
+        for (uint i = 0; i < k; i++) {
+            expert_indices[i] = indices[i];
+            expert_weights[i] = weights[i];
+        }
+    }
+}

@@ -1,0 +1,59 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Batch variant of fused RoPE + store-as-BF16 for prefill.
+// gl_WorkGroupID.y = batch index (token within prefill batch).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
+layout(set = 0, binding = 1) buffer readonly CosTable { float cos_table[]; };
+layout(set = 0, binding = 2) buffer readonly SinTable { float sin_table[]; };
+layout(set = 0, binding = 3) buffer Dst { uint dst_data[]; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint num_heads;
+    uint start_position;
+    uint half_dim;
+    uint kv_dim;
+};
+
+shared float rotated[4096];  // max kv_dim
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint position = start_position + batch_idx;
+
+    // Phase 1: Apply RoPE and write to shared memory
+    uint total_pairs = num_heads * half_dim;
+    uint src_batch_offset = batch_idx * kv_dim;
+    for (uint idx = tid; idx < total_pairs; idx += 256) {
+        uint head = idx / half_dim;
+        uint i = idx % half_dim;
+
+        uint base = src_batch_offset + head * head_dim;
+        float first = float(src_data[base + i]);
+        float second = float(src_data[base + half_dim + i]);
+
+        float cos_val = cos_table[position * half_dim + i];
+        float sin_val = sin_table[position * half_dim + i];
+
+        rotated[head * head_dim + i] = first * cos_val - second * sin_val;
+        rotated[head * head_dim + half_dim + i] = first * sin_val + second * cos_val;
+    }
+
+    barrier();
+
+    // Phase 2: Read consecutive pairs from shared memory and pack as BF16
+    uint pair_count = kv_dim / 2;
+    uint dst_base = position * pair_count;
+    for (uint pair = tid; pair < pair_count; pair += 256) {
+        float v0 = rotated[pair * 2];
+        float v1 = rotated[pair * 2 + 1];
+        uint bits0 = floatBitsToUint(v0);
+        uint bits1 = floatBitsToUint(v1);
+        dst_data[dst_base + pair] = (bits0 >> 16) | (bits1 & 0xFFFF0000u);
+    }
+}

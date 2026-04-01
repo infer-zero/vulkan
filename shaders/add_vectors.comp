@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer A { float16_t data_a[]; };
+layout(set = 0, binding = 1) buffer readonly B { float16_t data_b[]; };
+
+layout(push_constant) uniform Params {
+    uint count;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= count) return;
+
+#ifdef BATCH_MODE
+    uint offset = gl_WorkGroupID.y * count + idx;
+#else
+    uint offset = idx;
+#endif
+    data_a[offset] = float16_t(float(data_a[offset]) + float(data_b[offset]));
+}

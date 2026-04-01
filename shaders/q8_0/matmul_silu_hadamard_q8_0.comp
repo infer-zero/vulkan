@@ -1,0 +1,102 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Coalesced fused gate+up+SiLU matvec with K-splitting.
+// 512 threads: 128 panel rows x 4 K-splits.
+
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+#define PANEL_N 128
+#define Q8_BLOCK_SIZE 34
+#define TILE_K 256
+#define K_SPLITS 4
+
+shared float input_tile[TILE_K];
+shared float partial_gate[512];
+shared float partial_up[512];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint panel = gl_WorkGroupID.x;
+    uint row_in_panel = tid & 127u;
+    uint lane = tid >> 7u;
+    uint global_row = panel * PANEL_N + row_in_panel;
+
+    float gate_sum = 0.0;
+    float up_sum = 0.0;
+    bool valid_row = global_row < out_dim;
+
+    uint num_blocks = in_dim / 32;
+    uint panel_stride = num_blocks * PANEL_N * Q8_BLOCK_SIZE;
+    uint scale_section_size = num_blocks * PANEL_N * 2;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        if (tid < TILE_K) {
+            uint load_idx = tile_start + tid;
+            input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+        }
+        barrier();
+
+        if (valid_row) {
+            uint block_start = tile_start / 32;
+            uint blocks_in_tile = min(TILE_K, in_dim - tile_start) / 32;
+
+            for (uint bi = lane; bi < blocks_in_tile; bi += K_SPLITS) {
+                uint block_idx = block_start + bi;
+                uint scale_byte = panel * panel_stride + block_idx * PANEL_N * 2 + row_in_panel * 2;
+                uint data_byte = panel * panel_stride + scale_section_size + block_idx * PANEL_N * 32 + row_in_panel * 32;
+
+                uint g_sw = gate_data[scale_byte >> 2];
+                uint u_sw = up_data[scale_byte >> 2];
+                float g_scale = unpackHalf2x16((g_sw >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+                float u_scale = unpackHalf2x16((u_sw >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+
+                uint base_word = data_byte >> 2;
+                float g_block_sum = 0.0;
+                float u_block_sum = 0.0;
+                for (uint k = 0; k < 8; k++) {
+                    uint gp = gate_data[base_word + k];
+                    uint up_val = up_data[base_word + k];
+                    uint base_q = bi * 32 + k * 4;
+                    float i0 = input_tile[base_q + 0];
+                    float i1 = input_tile[base_q + 1];
+                    float i2 = input_tile[base_q + 2];
+                    float i3 = input_tile[base_q + 3];
+                    g_block_sum += i0 * float(bitfieldExtract(int(gp), 0, 8));
+                    g_block_sum += i1 * float(bitfieldExtract(int(gp), 8, 8));
+                    g_block_sum += i2 * float(bitfieldExtract(int(gp), 16, 8));
+                    g_block_sum += i3 * float(bitfieldExtract(int(gp), 24, 8));
+                    u_block_sum += i0 * float(bitfieldExtract(int(up_val), 0, 8));
+                    u_block_sum += i1 * float(bitfieldExtract(int(up_val), 8, 8));
+                    u_block_sum += i2 * float(bitfieldExtract(int(up_val), 16, 8));
+                    u_block_sum += i3 * float(bitfieldExtract(int(up_val), 24, 8));
+                }
+                gate_sum += g_scale * g_block_sum;
+                up_sum += u_scale * u_block_sum;
+            }
+        }
+        barrier();
+    }
+
+    // Reduce K_SPLITS partial sums per row
+    partial_gate[tid] = gate_sum;
+    partial_up[tid] = up_sum;
+    barrier();
+    if (lane == 0u && valid_row) {
+        float g = partial_gate[tid] + partial_gate[tid + 128] + partial_gate[tid + 256] + partial_gate[tid + 384];
+        float u = partial_up[tid] + partial_up[tid + 128] + partial_up[tid + 256] + partial_up[tid + 384];
+        float silu = g / (1.0 + exp(-g));
+        output_data[global_row] = float16_t(silu * u);
+    }
+}

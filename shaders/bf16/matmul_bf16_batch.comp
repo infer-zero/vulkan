@@ -1,0 +1,115 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Tiled GEMM: C[M,N] = A[M,K] x B^T[N,K]
+// A = input activations (f16, row-major [M x K])
+// B = weight matrix (bf16 packed as uint32, row-major [N x K/2])
+// C = output activations (f16, row-major [M x N])
+// M = batch_size, N = out_dim, K = in_dim
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 16
+#define WG_M 8       // threads in M direction
+#define WG_N 32      // threads in N direction (WG_M x WG_N = 256)
+#define THREAD_M 8   // TILE_M / WG_M = outputs per thread in M
+#define THREAD_N 4   // TILE_N / WG_N = outputs per thread in N
+#define A_STRIDE 17  // TILE_K + 1 padding to reduce bank conflicts
+#define B_STRIDE 17
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float16_t A_tile[TILE_M * A_STRIDE];   // 64 x 17 x 2 = 2.18 KB
+shared float16_t B_tile[TILE_N * B_STRIDE];   // 128 x 17 x 2 = 4.35 KB
+
+// BF16 -> fp16 with clamping (BF16 range exceeds fp16)
+float16_t bf16ToFp16(uint bf16_bits) {
+    float val = uintBitsToFloat(bf16_bits << 16);
+    return float16_t(clamp(val, -65504.0, 65504.0));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;   // output tile index (N direction)
+    uint wg_m = gl_WorkGroupID.y;   // batch tile index (M direction)
+
+    uint thread_m = tid / WG_N;     // 0..7
+    uint thread_n = tid % WG_N;     // 0..31
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    // Accumulators in registers: THREAD_M x THREAD_N = 8 x 4 = 32
+    float acc[THREAD_M * THREAD_N];
+    for (uint i = 0; i < THREAD_M * THREAD_N; i++) acc[i] = 0.0;
+
+    // Iterate over K dimension in tiles
+    for (uint k_base = 0; k_base < in_dim; k_base += TILE_K) {
+        // Load A tile: f16 SSBO -> fp16 shared memory (direct copy)
+        for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? input_data[gm * in_dim + k_base + k] : float16_t(0.0);
+        }
+
+        // Load B tile: bf16 -> fp16 with clamping
+        for (uint i = tid; i < TILE_N * (TILE_K / 2); i += 256) {
+            uint n = i / (TILE_K / 2);
+            uint k2 = i % (TILE_K / 2);
+            uint gn = n_base + n;
+            if (gn < out_dim) {
+                uint packed = weight_data[gn * (in_dim / 2) + k_base / 2 + k2];
+                B_tile[n * B_STRIDE + k2 * 2] = bf16ToFp16(packed & 0xFFFFu);
+                B_tile[n * B_STRIDE + k2 * 2 + 1] = bf16ToFp16(packed >> 16);
+            } else {
+                B_tile[n * B_STRIDE + k2 * 2] = float16_t(0.0);
+                B_tile[n * B_STRIDE + k2 * 2 + 1] = float16_t(0.0);
+            }
+        }
+
+        barrier();
+
+        // Compute outer products over the K tile (f32 accumulation)
+        for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = float(A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k]);
+            }
+            float b_vals[THREAD_N];
+            for (uint j = 0; j < THREAD_N; j++) {
+                b_vals[j] = float(B_tile[(thread_n * THREAD_N + j) * B_STRIDE + k]);
+            }
+            for (uint i = 0; i < THREAD_M; i++) {
+                for (uint j = 0; j < THREAD_N; j++) {
+                    acc[i * THREAD_N + j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write results
+    for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                output_data[gm * out_dim + gn] = float16_t(acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}

@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+#ifdef BF16_EMBEDDINGS
+layout(set = 0, binding = 0) buffer readonly EmbTable { uint emb_packed[]; };
+#else
+layout(set = 0, binding = 0) buffer readonly EmbTable { float emb_table[]; };
+#endif
+layout(set = 0, binding = 1) buffer State { float16_t state[]; };
+
+#ifdef BATCH_MODE
+layout(set = 0, binding = 2) buffer readonly TokenIds { uint token_ids[]; };
+#else
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+#endif
+
+layout(push_constant) uniform Params {
+    uint dim;
+#ifdef BF16_EMBEDDINGS
+    float embedding_multiplier;
+#endif
+};
+
+#ifdef BF16_EMBEDDINGS
+float bf16ToFloat(uint packed, uint lane) {
+    uint bits = (lane == 0u) ? (packed & 0xFFFFu) : (packed >> 16u);
+    return uintBitsToFloat(bits << 16u);
+}
+#endif
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= dim) return;
+
+#ifdef BATCH_MODE
+    uint batch_idx = gl_WorkGroupID.y;
+    uint token_id = token_ids[batch_idx];
+    uint dst = batch_idx * dim + idx;
+#else
+    uint token_id = dyn_token_id;
+    uint dst = idx;
+#endif
+
+#ifdef BF16_EMBEDDINGS
+    uint emb_idx = token_id * dim + idx;
+    uint word_idx = emb_idx >> 1u;
+    uint lane = emb_idx & 1u;
+    float val = bf16ToFloat(emb_packed[word_idx], lane) * embedding_multiplier;
+    state[dst] = float16_t(val);
+#else
+    state[dst] = float16_t(emb_table[token_id * dim + idx]);
+#endif
+}

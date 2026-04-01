@@ -1,0 +1,17 @@
+.{
+    .name = .vulkan_device,
+    .fingerprint = 0x394c415aaf7279e3,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .vulkan = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig#bed9e2d2241ade679b78892c829f41cecc2ef5ef",
+            .hash = "vulkan-0.0.0-r7YtxwA_AwAU4rmOITZD_KJs11Kie1sv0t-pcMDQGIqw",
+        },
+        .vulkan_headers = .{
+            .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#vulkan-sdk-1.3.283.0",
+            .hash = "N-V-__8AAAkkoQGn5z1yoNVrwqZfnYmZp8AZ5CJgoHRMQI0c",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "shaders" },
+}
