@@ -12,6 +12,10 @@
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#vulkan-sdk-1.3.283.0",
             .hash = "N-V-__8AAAkkoQGn5z1yoNVrwqZfnYmZp8AZ5CJgoHRMQI0c",
         },
+        .shaderc = .{
+            .url = "git+https://github.com/diogok/shaderc#c011e9d78a40ca78c4519348b30012bb9ba8c006",
+            .hash = "shaderc-0.0.1-n8BiyJgLDAC8yTufXaQu3gL_SkgaQis11EDyt4zoSdwu",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "shaders" },
 }
