@@ -1,0 +1,87 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Coalesced matvec for logits with K-splitting. Q4_0 panel-interleaved weights, F32 output.
+
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+#define PANEL_N 128
+#define Q4_BLOCK_SIZE 18
+#define TILE_K 256
+#define K_SPLITS 4
+
+shared float input_tile[TILE_K];
+shared float partial_sums[512];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint panel = gl_WorkGroupID.x;
+    uint row_in_panel = tid & 127u;
+    uint lane = tid >> 7u;
+    uint global_row = panel * PANEL_N + row_in_panel;
+
+    float sum = 0.0;
+    bool valid_row = global_row < out_dim;
+
+    uint num_blocks = in_dim / 32;
+    uint panel_stride = num_blocks * PANEL_N * Q4_BLOCK_SIZE;
+    uint scale_section_size = num_blocks * PANEL_N * 2;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        if (tid < TILE_K) {
+            uint load_idx = tile_start + tid;
+            input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+        }
+        barrier();
+
+        if (valid_row) {
+            uint block_start = tile_start / 32;
+            uint blocks_in_tile = min(TILE_K, in_dim - tile_start) / 32;
+
+            for (uint bi = lane; bi < blocks_in_tile; bi += K_SPLITS) {
+                uint block_idx = block_start + bi;
+                uint scale_byte = panel * panel_stride + block_idx * PANEL_N * 2 + row_in_panel * 2;
+                uint data_byte = panel * panel_stride + scale_section_size + block_idx * PANEL_N * 16 + row_in_panel * 16;
+
+                uint scale_word = weight_data[scale_byte >> 2];
+                float scale = unpackHalf2x16((scale_word >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+
+                uint base_word = data_byte >> 2;
+                float block_sum = 0.0;
+                // 4 uint32 words = 16 bytes = 32 nibble values
+                for (uint k = 0; k < 4; k++) {
+                    uint packed = weight_data[base_word + k];
+                    uint base_q = bi * 32;
+                    // Low nibbles: elements k*4 .. k*4+3
+                    block_sum += input_tile[base_q + k * 4 + 0] * float(int(packed & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 1] * float(int((packed >> 8u) & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 2] * float(int((packed >> 16u) & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 3] * float(int((packed >> 24u) & 0xFu) - 8);
+                    // High nibbles: elements k*4+16 .. k*4+19
+                    block_sum += input_tile[base_q + k * 4 + 16] * float(int((packed >> 4u) & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 17] * float(int((packed >> 12u) & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 18] * float(int((packed >> 20u) & 0xFu) - 8);
+                    block_sum += input_tile[base_q + k * 4 + 19] * float(int((packed >> 28u) & 0xFu) - 8);
+                }
+                sum += scale * block_sum;
+            }
+        }
+        barrier();
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    if (lane == 0u && valid_row) {
+        output_data[global_row] = partial_sums[tid] + partial_sums[tid + 128] + partial_sums[tid + 256] + partial_sums[tid + 384];
+    }
+}

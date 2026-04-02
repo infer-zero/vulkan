@@ -1,0 +1,149 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Panel-interleaved Q4_0 matvec: 128 threads (4 subgroups), 2 rows per WG.
+// Weight buffer layout (panel-interleaved, PANEL_N=128):
+//   Per panel: [f16 scales: num_blocks * PANEL_N * 2B][nibble data: num_blocks * PANEL_N * 16B]
+// Q4_0 block: 32 values in 18 bytes (2B f16 scale + 16B packed nibbles).
+// Low nibble = elements 0-15, high nibble = elements 16-31.
+//
+// Variants:
+//   (none)         -> f16 output (3buf: input, weights, output)
+//   STORE_BF16_KV  -> BF16 KV cache write (3buf + dyn: input, weights, kv_cache + dynamic)
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+#ifdef STORE_BF16_KV
+layout(set = 0, binding = 2) buffer KVCache { uint kv_cache[]; };
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+#else
+layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+};
+
+#define NUM_ROWS 2
+#define PANEL_N 128
+#define Q4_BLOCK_SIZE 18
+
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * NUM_ROWS;
+
+    uint num_blocks = in_dim / 32;
+    uint panel_stride_u32 = num_blocks * PANEL_N * Q4_BLOCK_SIZE / 4;
+    uint scale_section_u32 = num_blocks * PANEL_N / 2;
+
+    // Each thread handles 8 elements per iteration.
+    // sub_elem: element position within 32-element block (0,8,16,24)
+    uint sub_elem = (tid * 8) & 31u;
+    // Byte offset within 16-byte data section (0 or 8)
+    uint sub_byte_offset = sub_elem & 15u;
+    // Nibble shift: 0 for low nibbles (elements 0-15), 4 for high nibbles (elements 16-31)
+    uint nibble_shift = (sub_elem >= 16u) ? 4u : 0u;
+
+    uint panel_base_u32[NUM_ROWS];
+    uint scale_off_u32[NUM_ROWS];
+    uint data_base_u32[NUM_ROWS];
+    uint scale_shift[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        uint row = first_row + n;
+        uint panel = row / PANEL_N;
+        uint col_in_panel = row % PANEL_N;
+        panel_base_u32[n] = panel * panel_stride_u32;
+        uint scale_byte = col_in_panel * 2;
+        scale_off_u32[n] = scale_byte >> 2;
+        scale_shift[n] = (scale_byte & 2u) * 8u;
+        data_base_u32[n] = panel_base_u32[n] + scale_section_u32 + (col_in_panel * 16 + sub_byte_offset) / 4;
+    }
+
+    uint scale_stride_u32 = PANEL_N / 2;
+    uint data_stride_u32 = PANEL_N * 16 / 4;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
+
+    uint input_base = tid * 4;
+    uint block_idx = (tid * 8) / 32;
+
+    for (uint col = tid * 8; col < in_dim; col += 1024) {
+        // Read 8 input f16 values as 4 packed uint32
+        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
+        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
+        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
+        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
+        input_base += 512; // 1024 / 2
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row >= out_dim) break;
+
+            // Scale: read from scale section
+            uint si = panel_base_u32[n] + scale_off_u32[n] + block_idx * scale_stride_u32;
+            float scale = unpackHalf2x16((weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+
+            // Data: 2 uint32 words (8 bytes = 8 nibble values via nibble_shift)
+            uint di = data_base_u32[n] + block_idx * data_stride_u32;
+            uint w0 = weight_data[di];
+            uint w1 = weight_data[di + 1];
+
+            float dot_sum =
+                b01.x * float(int((w0 >> nibble_shift) & 0xFu) - 8) +
+                b01.y * float(int((w0 >> (8u + nibble_shift)) & 0xFu) - 8) +
+                b23.x * float(int((w0 >> (16u + nibble_shift)) & 0xFu) - 8) +
+                b23.y * float(int((w0 >> (24u + nibble_shift)) & 0xFu) - 8) +
+                b45.x * float(int((w1 >> nibble_shift) & 0xFu) - 8) +
+                b45.y * float(int((w1 >> (8u + nibble_shift)) & 0xFu) - 8) +
+                b67.x * float(int((w1 >> (16u + nibble_shift)) & 0xFu) - 8) +
+                b67.y * float(int((w1 >> (24u + nibble_shift)) & 0xFu) - 8);
+
+            temp[n] += scale * dot_sum;
+        }
+        block_idx += 32; // 1024 / 32
+    }
+
+    // Reduce: subgroupAdd within each subgroup
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Cross-subgroup reduction via shared memory
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            tmpsh[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+#ifdef STORE_BF16_KV
+        uint kv_offset = dyn_position * out_dim;
+        float v0 = tmpsh[0][0] + tmpsh[0][1] + tmpsh[0][2] + tmpsh[0][3];
+        if (first_row + 1 < out_dim) {
+            float v1 = tmpsh[1][0] + tmpsh[1][1] + tmpsh[1][2] + tmpsh[1][3];
+            uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
+            kv_cache[(kv_offset + first_row) / 2] = packed;
+        } else if (first_row < out_dim) {
+            uint packed = (floatBitsToUint(v0) >> 16);
+            kv_cache[(kv_offset + first_row) / 2] = packed;
+        }
+#else
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row < out_dim) {
+                float result = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
+                output_data[row] = float16_t(result);
+            }
+        }
+#endif
+    }
+}
