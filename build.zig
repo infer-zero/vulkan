@@ -124,11 +124,9 @@ const q4_k_shaders = [_]Shader{
 };
 
 const q6_k_shaders = [_]Shader{
-    shader("shaders/q6_k", "f16_to_bf16"),
     shader("shaders/q6_k", "matmul_q6_k_panel_matvec"),
     shader("shaders/q6_k", "matmul_q6_k_batch"),
     // Variants
-    variant("shaders/q6_k", "f16_to_bf16", "f16_to_bf16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders/q6_k", "matmul_q6_k_panel_matvec", "matmul_q6_k_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
 };
 
