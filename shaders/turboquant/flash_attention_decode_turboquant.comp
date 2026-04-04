@@ -1,0 +1,232 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// FlashDecoding with TurboQuant MSE-only KV cache.
+// Pre-rotates query via RHT, then scores against 3-bit quantized keys.
+// No QJL — MSE-only gives lower variance after softmax.
+//
+// Dispatch: (num_heads, 1, 1), one workgroup per attention head.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
+layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 4) buffer readonly SignFlips { float sign_data[]; };
+
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint kv_dim;
+    uint num_heads;
+    uint queries_per_kv;
+    uint batch_size;
+    float scale;
+    float rope_theta;
+    uint layer_idx;
+    float cen[8];
+};
+
+#define NUM_WARPS 8
+#define WARP_SIZE 32
+
+shared float smem_m[NUM_WARPS];
+shared float smem_l[NUM_WARPS];
+shared float smem_o[NUM_WARPS * 128];
+shared float q_shared[128];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane = tid % WARP_SIZE;
+
+    if (head >= num_heads) return;
+
+    uint start_position = dyn_position;
+    uint kv_head = head / queries_per_kv;
+    uint count = start_position + 1;
+    uint kv_heads = num_heads / queries_per_kv;
+
+    uint mse_words = (head_dim * 3 + 31) / 32;
+    uint key_u32s = 1 + mse_words;
+    uint data_words_v = head_dim / 16;
+    uint groups_per_head = head_dim / 32;
+    uint scale_words_v = (groups_per_head + 1) / 2;
+    uint val_u32s = data_words_v + scale_words_v + scale_words_v;
+
+    uint sign_offset = layer_idx * head_dim;
+    uint half_dim = head_dim / 2;
+
+    // ---- Phase 0: Load query, apply RoPE, pre-rotate via RHT ----
+    if (tid < head_dim) {
+        q_shared[tid] = float(query_data[head * head_dim + tid]);
+    }
+    barrier();
+
+    if (tid < half_dim) {
+        float freq = 1.0 / pow(rope_theta, float(tid * 2) / float(head_dim));
+        float cos_val = cos(float(start_position) * freq);
+        float sin_val = sin(float(start_position) * freq);
+        float first = q_shared[tid];
+        float second = q_shared[tid + half_dim];
+        q_shared[tid] = first * cos_val - second * sin_val;
+        q_shared[tid + half_dim] = first * sin_val + second * cos_val;
+    }
+    barrier();
+
+    // RHT: sign flips + WHT
+    if (tid < head_dim) q_shared[tid] *= sign_data[sign_offset + tid];
+    barrier();
+    for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
+        if (tid < head_dim && (tid & stride) == 0) {
+            float a = q_shared[tid];
+            float b = q_shared[tid | stride];
+            q_shared[tid] = a + b;
+            q_shared[tid | stride] = a - b;
+        }
+        barrier();
+    }
+    float rht_scale = 1.0 / sqrt(float(head_dim));
+    if (tid < head_dim) q_shared[tid] *= rht_scale;
+    barrier();
+
+    // Load rotated query into per-lane registers
+    uint dim_passes = head_dim / 64;
+    float rq[4];
+    for (uint pass = 0; pass < dim_passes; pass++) {
+        uint d0 = pass * 64 + lane * 2;
+        rq[pass * 2]     = q_shared[d0];
+        rq[pass * 2 + 1] = q_shared[d0 + 1];
+    }
+    barrier();
+
+    // ---- Phase 1: Iterate over KV positions with online softmax ----
+    uint key_u32_per_pos = kv_heads * key_u32s;
+    uint val_u32_per_pos = kv_heads * val_u32s;
+    uint key_head_off = kv_head * key_u32s;
+    uint val_head_off = kv_head * val_u32s;
+
+    uint warp_chunk = (count + NUM_WARPS - 1) / NUM_WARPS;
+    uint pos_start = warp_id * warp_chunk;
+    uint pos_end = min(pos_start + warp_chunk, count);
+
+    float m = -1.0 / 0.0;
+    float l_val = 0.0;
+    float ov[4];
+    for (uint i = 0; i < dim_passes * 2; i++) ov[i] = 0.0;
+
+    for (uint pos = pos_start; pos < pos_end; pos++) {
+        uint key_base = pos * key_u32_per_pos + key_head_off;
+        uint val_base = pos * val_u32_per_pos + val_head_off;
+
+        float k_norm = uintBitsToFloat(k_cache[key_base]);
+
+        // ---- 3-bit MSE score (direct indexed) ----
+        float mse_local = 0.0;
+        for (uint pass = 0; pass < dim_passes; pass++) {
+            uint d0 = pass * 64 + lane * 2;
+            for (uint elem = 0; elem < 2; elem++) {
+                uint d = d0 + elem;
+                uint bit_pos = d * 3;
+                uint word = bit_pos / 32;
+                uint bit = bit_pos % 32;
+                uint raw = k_cache[key_base + 1 + word];
+                uint idx = (raw >> bit) & 7u;
+                if (bit > 29) {
+                    idx |= (k_cache[key_base + 1 + word + 1] << (32 - bit)) & 7u;
+                }
+                mse_local += rq[pass * 2 + elem] * cen[idx];
+            }
+        }
+        float dot = subgroupAdd(mse_local) * k_norm * scale;
+
+        // Online softmax
+        float new_m = max(m, dot);
+        float correction = exp(m - new_m);
+        float p = exp(dot - new_m);
+        l_val = l_val * correction + p;
+
+        // ---- Value dequantize + accumulate ----
+        for (uint pass = 0; pass < dim_passes; pass++) {
+            uint d0 = pass * 64 + lane * 2;
+            uint grp = d0 / 32;
+
+            uint scale_off = val_base + data_words_v + grp / 2;
+            uint zero_off = val_base + data_words_v + scale_words_v + grp / 2;
+            vec2 scales = unpackHalf2x16(v_cache[scale_off]);
+            vec2 zeros = unpackHalf2x16(v_cache[zero_off]);
+            float v_sc = (grp % 2 == 0) ? scales.x : scales.y;
+            float v_zero = (grp % 2 == 0) ? zeros.x : zeros.y;
+
+            uint dw0 = val_base + d0 / 16;
+            uint raw0 = v_cache[dw0];
+            uint q0 = (raw0 >> ((d0 % 16) * 2)) & 3u;
+            uint q1 = (raw0 >> (((d0 + 1) % 16) * 2)) & 3u;
+
+            float v0 = float(q0) * v_sc + v_zero;
+            float v1;
+            if ((d0 + 1) / 32 != grp) {
+                uint grp1 = (d0 + 1) / 32;
+                uint so1 = val_base + data_words_v + grp1 / 2;
+                uint zo1 = val_base + data_words_v + scale_words_v + grp1 / 2;
+                vec2 s1 = unpackHalf2x16(v_cache[so1]);
+                vec2 z1 = unpackHalf2x16(v_cache[zo1]);
+                v1 = float(q1) * ((grp1 % 2 == 0) ? s1.x : s1.y) + ((grp1 % 2 == 0) ? z1.x : z1.y);
+            } else {
+                v1 = float(q1) * v_sc + v_zero;
+            }
+
+            ov[pass * 2]     = ov[pass * 2]     * correction + p * v0;
+            ov[pass * 2 + 1] = ov[pass * 2 + 1] * correction + p * v1;
+        }
+        m = new_m;
+    }
+
+    // ---- Phase 2: Reduce across warps ----
+    for (uint pass = 0; pass < dim_passes; pass++) {
+        uint d0 = pass * 64 + lane * 2;
+        smem_o[warp_id * head_dim + d0]     = ov[pass * 2];
+        smem_o[warp_id * head_dim + d0 + 1] = ov[pass * 2 + 1];
+    }
+    if (lane == 0) { smem_m[warp_id] = m; smem_l[warp_id] = l_val; }
+    barrier();
+
+    if (warp_id == 0) {
+        float final_m = smem_m[0];
+        float final_l = smem_l[0];
+        float fo[4];
+        for (uint pass = 0; pass < dim_passes; pass++) {
+            uint d0 = pass * 64 + lane * 2;
+            fo[pass * 2]     = smem_o[d0];
+            fo[pass * 2 + 1] = smem_o[d0 + 1];
+        }
+        for (uint w = 1; w < NUM_WARPS; w++) {
+            float w_m = smem_m[w]; float w_l = smem_l[w];
+            if (w_l == 0.0) continue;
+            float new_m = max(final_m, w_m);
+            float c_old = exp(final_m - new_m);
+            float c_new = exp(w_m - new_m);
+            for (uint pass = 0; pass < dim_passes; pass++) {
+                uint d0 = pass * 64 + lane * 2;
+                fo[pass * 2]     = fo[pass * 2]     * c_old + smem_o[w * head_dim + d0]     * c_new;
+                fo[pass * 2 + 1] = fo[pass * 2 + 1] * c_old + smem_o[w * head_dim + d0 + 1] * c_new;
+            }
+            final_l = final_l * c_old + w_l * c_new;
+            final_m = new_m;
+        }
+
+        uint out_base = head * head_dim;
+        float inv_l = 1.0 / final_l;
+        for (uint pass = 0; pass < dim_passes; pass++) {
+            uint d0 = pass * 64 + lane * 2;
+            output_data[out_base + d0]     = float16_t(fo[pass * 2]     * inv_l);
+            output_data[out_base + d0 + 1] = float16_t(fo[pass * 2 + 1] * inv_l);
+        }
+    }
+}

@@ -1,0 +1,205 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// TurboQuant MSE-only prefill attention with causal masking.
+// Dispatch: (ceil(batch_size/TILE_Q) * num_heads, 1, 1)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
+layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 4) buffer readonly SignFlips { float sign_data[]; };
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint kv_dim;
+    uint num_heads;
+    uint queries_per_kv;
+    uint start_position;
+    uint batch_size;
+    float scale;
+    uint capacity;
+    float rope_theta;
+    uint layer_idx;
+    float cen[8];
+};
+
+#define TILE_Q 8
+#define TILE_KV 32
+
+shared float q_rot_tile[TILE_Q * 128];
+shared float dot_scores[TILE_Q * TILE_KV];
+shared float dequant_v[TILE_KV * 128];
+shared float q_temp[128];
+
+void main() {
+    uint wg_id = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint head = wg_id % num_heads;
+    uint q_tile_idx = wg_id / num_heads;
+    uint kv_head = head / queries_per_kv;
+    uint kv_heads = num_heads / queries_per_kv;
+
+    uint sign_offset = layer_idx * head_dim;
+    uint half_dim = head_dim / 2;
+    float rht_scale = 1.0 / sqrt(float(head_dim));
+
+    uint mse_words = (head_dim * 3 + 31) / 32;
+    uint key_u32s = 1 + mse_words;
+    uint data_words_v = head_dim / 16;
+    uint groups_per_head = head_dim / 32;
+    uint scale_words_v = (groups_per_head + 1) / 2;
+    uint val_u32s = data_words_v + scale_words_v + scale_words_v;
+
+    // ---- Phase 0: Pre-rotate all TILE_Q queries via RHT ----
+    for (uint qi = 0; qi < TILE_Q; qi++) {
+        uint query_idx = q_tile_idx * TILE_Q + qi;
+        if (query_idx >= batch_size) {
+            if (tid < head_dim) q_rot_tile[qi * head_dim + tid] = 0.0;
+            barrier();
+            continue;
+        }
+
+        uint q_base = query_idx * num_heads * head_dim + head * head_dim;
+        if (tid < head_dim) q_temp[tid] = float(query_data[q_base + tid]);
+        barrier();
+
+        // RoPE
+        uint position = start_position + query_idx;
+        if (tid < half_dim) {
+            float freq = 1.0 / pow(rope_theta, float(tid * 2) / float(head_dim));
+            float cos_val = cos(float(position) * freq);
+            float sin_val = sin(float(position) * freq);
+            float first = q_temp[tid];
+            float second = q_temp[tid + half_dim];
+            q_temp[tid] = first * cos_val - second * sin_val;
+            q_temp[tid + half_dim] = first * sin_val + second * cos_val;
+        }
+        barrier();
+
+        // RHT
+        if (tid < head_dim) q_temp[tid] *= sign_data[sign_offset + tid];
+        barrier();
+        for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
+            if (tid < head_dim && (tid & stride) == 0) {
+                float a = q_temp[tid];
+                float b = q_temp[tid | stride];
+                q_temp[tid] = a + b;
+                q_temp[tid | stride] = a - b;
+            }
+            barrier();
+        }
+        if (tid < head_dim) q_rot_tile[qi * head_dim + tid] = q_temp[tid] * rht_scale;
+        barrier();
+    }
+
+    // ---- Phase 1: Online softmax over KV tiles ----
+    float m_vals[TILE_Q];
+    float l_vals[TILE_Q];
+    float ov_vals[TILE_Q];
+    for (uint qi = 0; qi < TILE_Q; qi++) { m_vals[qi] = -1.0/0.0; l_vals[qi] = 0.0; ov_vals[qi] = 0.0; }
+
+    uint key_u32_per_pos = kv_heads * key_u32s;
+    uint val_u32_per_pos = kv_heads * val_u32s;
+    uint key_head_off = kv_head * key_u32s;
+    uint val_head_off = kv_head * val_u32s;
+
+    uint max_query_idx = min(q_tile_idx * TILE_Q + TILE_Q, batch_size);
+    uint max_kv_count = start_position + max_query_idx;
+
+    for (uint kv_tile = 0; kv_tile < max_kv_count; kv_tile += TILE_KV) {
+        uint tile_size = min(TILE_KV, max_kv_count - kv_tile);
+
+        // ---- Compute Q.K scores ----
+        for (uint idx = tid; idx < TILE_Q * tile_size; idx += 256) {
+            uint qi = idx / tile_size;
+            uint ki = idx % tile_size;
+            uint kv_pos = kv_tile + ki;
+
+            uint query_idx = q_tile_idx * TILE_Q + qi;
+            if (query_idx >= batch_size || kv_pos >= start_position + query_idx + 1) {
+                dot_scores[qi * TILE_KV + ki] = -1.0 / 0.0;
+                continue;
+            }
+
+            uint key_base = kv_pos * key_u32_per_pos + key_head_off;
+            float k_norm = uintBitsToFloat(k_cache[key_base]);
+
+            // 3-bit MSE score
+            float mse_score = 0.0;
+            for (uint d = 0; d < head_dim; d++) {
+                uint bit_pos = d * 3;
+                uint word = bit_pos / 32;
+                uint bit = bit_pos % 32;
+                uint raw = k_cache[key_base + 1 + word];
+                uint c_idx = (raw >> bit) & 7u;
+                if (bit > 29) c_idx |= (k_cache[key_base + 1 + word + 1] << (32 - bit)) & 7u;
+                mse_score += q_rot_tile[qi * head_dim + d] * cen[c_idx];
+            }
+            dot_scores[qi * TILE_KV + ki] = mse_score * k_norm * scale;
+        }
+        barrier();
+
+        // ---- Dequantize values ----
+        for (uint idx = tid; idx < tile_size * head_dim; idx += 256) {
+            uint ki = idx / head_dim;
+            uint d = idx % head_dim;
+            uint kv_pos = kv_tile + ki;
+            uint val_base = kv_pos * val_u32_per_pos + val_head_off;
+
+            uint dw = val_base + d / 16;
+            uint q_val = (v_cache[dw] >> ((d % 16) * 2)) & 3u;
+
+            uint grp = d / 32;
+            uint so = val_base + data_words_v + grp / 2;
+            uint zo = val_base + data_words_v + scale_words_v + grp / 2;
+            vec2 sc = unpackHalf2x16(v_cache[so]);
+            vec2 zr = unpackHalf2x16(v_cache[zo]);
+            float v_sc = (grp % 2 == 0) ? sc.x : sc.y;
+            float v_zr = (grp % 2 == 0) ? zr.x : zr.y;
+            dequant_v[ki * head_dim + d] = float(q_val) * v_sc + v_zr;
+        }
+        barrier();
+
+        // ---- Online softmax + value accumulation ----
+        if (tid < head_dim) {
+            for (uint qi = 0; qi < TILE_Q; qi++) {
+                uint query_idx = q_tile_idx * TILE_Q + qi;
+                if (query_idx >= batch_size) continue;
+
+                float tile_max = -1.0 / 0.0;
+                for (uint ki = 0; ki < tile_size; ki++)
+                    tile_max = max(tile_max, dot_scores[qi * TILE_KV + ki]);
+
+                float new_m = max(m_vals[qi], tile_max);
+                float correction = exp(m_vals[qi] - new_m);
+                ov_vals[qi] *= correction;
+                l_vals[qi] *= correction;
+
+                for (uint ki = 0; ki < tile_size; ki++) {
+                    float p = exp(dot_scores[qi * TILE_KV + ki] - new_m);
+                    ov_vals[qi] += p * dequant_v[ki * head_dim + tid];
+                    l_vals[qi] += p;
+                }
+                m_vals[qi] = new_m;
+            }
+        }
+        barrier();
+    }
+
+    // ---- Write output ----
+    if (tid < head_dim) {
+        for (uint qi = 0; qi < TILE_Q; qi++) {
+            uint query_idx = q_tile_idx * TILE_Q + qi;
+            if (query_idx >= batch_size) continue;
+            uint out_base = query_idx * num_heads * head_dim + head * head_dim;
+            float inv_l = (l_vals[qi] > 0.0) ? (1.0 / l_vals[qi]) : 0.0;
+            output_data[out_base + tid] = float16_t(ov_vals[qi] * inv_l);
+        }
+    }
+}

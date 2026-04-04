@@ -1,0 +1,153 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// TurboQuant MSE-only key quantization: RHT + 3-bit Lloyd-Max.
+// No QJL residual — MSE-only gives lower variance after softmax.
+//
+// Key layout per head: [f32 norm] + [3-bit packed indices]
+// For head_dim=128: 1 + 12 = 13 u32s. For head_dim=64: 1 + 6 = 7 u32s.
+//
+// Each workgroup processes one KV head.
+// Dispatch: (kv_heads, 1, 1) for decode, (kv_heads, batch_size, 1) for prefill.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
+layout(set = 0, binding = 1) buffer readonly CosTable { float cos_table[]; };
+layout(set = 0, binding = 2) buffer readonly SinTable { float sin_table[]; };
+layout(set = 0, binding = 3) buffer Dst { uint dst_data[]; };
+layout(set = 0, binding = 4) buffer readonly SignFlips { float sign_data[]; };
+
+#ifdef BATCH_MODE
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint kv_heads;
+    uint start_position;
+    uint half_dim;
+    uint kv_dim;
+    uint layer_idx;
+    float cen[8];
+    float bnd[7];
+};
+#else
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint kv_heads;
+    uint half_dim;
+    uint kv_dim;
+    uint layer_idx;
+    float cen[8];
+    float bnd[7];
+};
+#endif
+
+shared float rotated[128];
+shared float norm_scratch[128];
+shared uint packed[12]; // max mse_words for head_dim=128
+
+uint quantize3bit(float val) {
+    if (val < bnd[3]) {
+        if (val < bnd[1]) return val < bnd[0] ? 0u : 1u;
+        else              return val < bnd[2] ? 2u : 3u;
+    } else {
+        if (val < bnd[5]) return val < bnd[4] ? 4u : 5u;
+        else              return val < bnd[6] ? 6u : 7u;
+    }
+}
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (head >= kv_heads) return;
+
+    uint mse_words = (head_dim * 3 + 31) / 32;
+    uint u32s_per_head = 1 + mse_words;
+
+#ifdef BATCH_MODE
+    uint batch_idx = gl_WorkGroupID.y;
+    uint position = start_position + batch_idx;
+    uint src_offset = batch_idx * kv_dim + head * head_dim;
+#else
+    uint position = dyn_position;
+    uint src_offset = head * head_dim;
+#endif
+
+    uint sign_offset = layer_idx * head_dim;
+
+    // ---- Phase 1: Apply RoPE ----
+    if (tid < head_dim) {
+        uint i = tid;
+        float val;
+        if (i < half_dim) {
+            float first = float(src_data[src_offset + i]);
+            float second = float(src_data[src_offset + half_dim + i]);
+            val = first * cos_table[position * half_dim + i] - second * sin_table[position * half_dim + i];
+        } else {
+            uint pair_i = i - half_dim;
+            float first = float(src_data[src_offset + pair_i]);
+            float second = float(src_data[src_offset + i]);
+            val = first * sin_table[position * half_dim + pair_i] + second * cos_table[position * half_dim + pair_i];
+        }
+        rotated[i] = val;
+    }
+    barrier();
+
+    // ---- Phase 2: Compute norm and normalize ----
+    norm_scratch[tid] = (tid < head_dim) ? rotated[tid] * rotated[tid] : 0.0;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) norm_scratch[tid] += norm_scratch[tid + s];
+        barrier();
+    }
+    float norm = sqrt(norm_scratch[0]);
+    float inv_norm = (norm > 1e-10) ? (1.0 / norm) : 0.0;
+    if (tid < head_dim) rotated[tid] *= inv_norm;
+    barrier();
+
+    // ---- Phase 3: RHT (sign flip + WHT) ----
+    if (tid < head_dim) rotated[tid] *= sign_data[sign_offset + tid];
+    barrier();
+    for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
+        if (tid < head_dim && (tid & stride) == 0) {
+            float a = rotated[tid];
+            float b = rotated[tid | stride];
+            rotated[tid] = a + b;
+            rotated[tid | stride] = a - b;
+        }
+        barrier();
+    }
+    float rht_scale = 1.0 / sqrt(float(head_dim));
+    float y_val = (tid < head_dim) ? rotated[tid] * rht_scale : 0.0;
+
+    // ---- Phase 4: 3-bit quantize and pack ----
+    uint mse_idx = quantize3bit(y_val);
+
+    // Pack 3-bit indices: each thread contributes its index at bit position tid*3
+    if (tid < mse_words) packed[tid] = 0u;
+    barrier();
+
+    if (tid < head_dim) {
+        uint bit_pos = tid * 3;
+        uint word = bit_pos / 32;
+        uint bit = bit_pos % 32;
+        atomicOr(packed[word], mse_idx << bit);
+        if (bit > 29) {
+            atomicOr(packed[word + 1], mse_idx >> (32 - bit));
+        }
+    }
+    barrier();
+
+    // ---- Phase 5: Store ----
+    uint u32_per_pos = kv_heads * u32s_per_head;
+    uint out_base = position * u32_per_pos + head * u32s_per_head;
+
+    if (tid == 0) {
+        dst_data[out_base] = floatBitsToUint(norm);
+    }
+    if (tid < mse_words) {
+        dst_data[out_base + 1 + tid] = packed[tid];
+    }
+}

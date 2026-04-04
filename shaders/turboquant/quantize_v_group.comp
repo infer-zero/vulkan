@@ -1,0 +1,119 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Group quantization for value cache: 2-bit asymmetric min-max per group of 32.
+//
+// Value buffer layout per head (variable, depends on head_dim):
+//   uint32[0..data_words-1]:                    2-bit packed data (head_dim values)
+//   uint32[data_words..data_words+scale_words-1]: f16 group scales (2 per u32)
+//   uint32[...]:                                  f16 group zeros (2 per u32)
+//   where data_words = head_dim/16, scale_words = ceil(groups/2), groups = head_dim/32
+//
+// Variants:
+//   (none)       -> single-token decode, position from dynamic params SSBO
+//   BATCH_MODE   -> prefill batch, gl_WorkGroupID.y = batch index
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
+layout(set = 0, binding = 1) buffer Dst { uint dst_data[]; };
+
+#ifdef BATCH_MODE
+layout(push_constant) uniform Params {
+    uint kv_dim;
+    uint kv_heads;
+    uint head_dim;
+    uint start_position;
+};
+#else
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+
+layout(push_constant) uniform Params {
+    uint kv_dim;
+    uint kv_heads;
+    uint head_dim;
+};
+#endif
+
+#define GROUP_SIZE 32
+
+shared float values[4096];  // max kv_dim
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint groups_per_head = head_dim / GROUP_SIZE;
+    uint data_words = head_dim / 16;                  // 2-bit packed: 16 values per u32
+    uint scale_words = (groups_per_head + 1) / 2;     // 2 f16 per u32
+    uint u32s_per_head = data_words + scale_words + scale_words;
+
+#ifdef BATCH_MODE
+    uint batch_idx = gl_WorkGroupID.y;
+    uint position = start_position + batch_idx;
+    uint src_batch_offset = batch_idx * kv_dim;
+#else
+    uint position = dyn_position;
+#endif
+
+    // Phase 1: Load f16 values to shared memory
+    for (uint idx = tid; idx < kv_dim; idx += 256) {
+#ifdef BATCH_MODE
+        values[idx] = float(src_data[src_batch_offset + idx]);
+#else
+        values[idx] = float(src_data[idx]);
+#endif
+    }
+    barrier();
+
+    // Phase 2: Quantize each head's values with group quantization
+    uint u32_per_pos = kv_heads * u32s_per_head;
+    uint dst_base = position * u32_per_pos;
+
+    for (uint head = tid; head < kv_heads; head += 256) {
+        uint head_off = head * head_dim;
+        uint out_base = dst_base + head * u32s_per_head;
+
+        for (uint g = 0; g < groups_per_head; g++) {
+            uint grp_off = head_off + g * GROUP_SIZE;
+
+            // Find min and max
+            float v_min = values[grp_off];
+            float v_max = values[grp_off];
+            for (uint i = 1; i < GROUP_SIZE; i++) {
+                float v = values[grp_off + i];
+                v_min = min(v_min, v);
+                v_max = max(v_max, v);
+            }
+
+            // Compute scale: (max - min) / 3 for 2-bit (4 levels: 0,1,2,3)
+            float sc = (v_max - v_min) / 3.0;
+            if (sc < 1e-10) sc = 1e-10;
+            float inv_sc = 1.0 / sc;
+
+            // Quantize and pack: 16 values per uint32 (2-bit each)
+            for (uint w = 0; w < 2; w++) {
+                uint packed = 0u;
+                for (uint i = 0; i < 16; i++) {
+                    float v = values[grp_off + w * 16 + i];
+                    float q = clamp(round((v - v_min) * inv_sc), 0.0, 3.0);
+                    packed |= uint(q) << (i * 2);
+                }
+                dst_data[out_base + g * 2 + w] = packed;
+            }
+
+            // Store scale and zero as f16 (packed 2 per uint32)
+            uint scale_u16 = packHalf2x16(vec2(sc, 0.0)) & 0xFFFFu;
+            uint zero_u16 = packHalf2x16(vec2(v_min, 0.0)) & 0xFFFFu;
+
+            uint scale_base = out_base + data_words;
+            uint zero_base = scale_base + scale_words;
+
+            if (g % 2 == 0) {
+                dst_data[scale_base + g / 2] = scale_u16;
+                dst_data[zero_base + g / 2] = zero_u16;
+            } else {
+                dst_data[scale_base + g / 2] |= (scale_u16 << 16);
+                dst_data[zero_base + g / 2] |= (zero_u16 << 16);
+            }
+        }
+    }
+}
