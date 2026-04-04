@@ -77,6 +77,9 @@ void main() {
         vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
         input_base += 512; // 1024 / 2
 
+        // Precompute sum of input values for asymmetric min correction
+        float input_sum = b01.x + b01.y + b23.x + b23.y + b45.x + b45.y + b67.x + b67.y;
+
         // Determine position within super-block structure
         uint super_block_idx = col / SUPER_BLOCK_ELEMS;
         uint elem_in_block = col % SUPER_BLOCK_ELEMS;
@@ -120,17 +123,19 @@ void main() {
             uint w0 = weight_data[word_off];
             uint w1 = weight_data[word_off + 1];
 
-            float dot_sum =
-                b01.x * (d_sc * float((w0 >> nibble_shift) & 0xFu) - dmin_mn) +
-                b01.y * (d_sc * float((w0 >> (8u + nibble_shift)) & 0xFu) - dmin_mn) +
-                b23.x * (d_sc * float((w0 >> (16u + nibble_shift)) & 0xFu) - dmin_mn) +
-                b23.y * (d_sc * float((w0 >> (24u + nibble_shift)) & 0xFu) - dmin_mn) +
-                b45.x * (d_sc * float((w1 >> nibble_shift) & 0xFu) - dmin_mn) +
-                b45.y * (d_sc * float((w1 >> (8u + nibble_shift)) & 0xFu) - dmin_mn) +
-                b67.x * (d_sc * float((w1 >> (16u + nibble_shift)) & 0xFu) - dmin_mn) +
-                b67.y * (d_sc * float((w1 >> (24u + nibble_shift)) & 0xFu) - dmin_mn);
+            // Factor out dmin_mn: sum(input * (d_sc*nibble - dmin_mn))
+            //   = d_sc * sum(input * nibble) - dmin_mn * sum(input)
+            float nibble_dot =
+                b01.x * float((w0 >> nibble_shift) & 0xFu) +
+                b01.y * float((w0 >> (8u + nibble_shift)) & 0xFu) +
+                b23.x * float((w0 >> (16u + nibble_shift)) & 0xFu) +
+                b23.y * float((w0 >> (24u + nibble_shift)) & 0xFu) +
+                b45.x * float((w1 >> nibble_shift) & 0xFu) +
+                b45.y * float((w1 >> (8u + nibble_shift)) & 0xFu) +
+                b67.x * float((w1 >> (16u + nibble_shift)) & 0xFu) +
+                b67.y * float((w1 >> (24u + nibble_shift)) & 0xFu);
 
-            temp[n] += dot_sum;
+            temp[n] += d_sc * nibble_dot - dmin_mn * input_sum;
         }
     }
 
