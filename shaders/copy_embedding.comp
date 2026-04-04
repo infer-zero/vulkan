@@ -1,6 +1,10 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
+// Copy token embedding into the state buffer.
+// Supports f32 and packed BF16 embedding formats (via BF16_EMBEDDINGS).
+// Decode reads token_id from DynamicParams SSBO; prefill from a token_ids buffer.
+
 layout(local_size_x = 256) in;
 
 #ifdef BF16_EMBEDDINGS

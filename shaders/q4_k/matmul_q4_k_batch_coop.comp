@@ -41,8 +41,9 @@ layout(push_constant) uniform Params {
 shared float16_t A_tile[TILE_M * A_STRIDE];
 shared float16_t B_tile[TILE_N * B_STRIDE];
 shared float scratch[8 * 256];
+// Total: ~28 KB
 
-void unpack_scale_min(uint j, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint j, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = j & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -122,7 +123,7 @@ void main() {
                 float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
 
                 float sc, mn;
-                unpack_scale_min(sub_block_in_sb, h1, h2, h3, sc, mn);
+                unpackScaleMin(sub_block_in_sb, h1, h2, h3, sc, mn);
                 float d_sc = d * sc;
                 float dmin_mn = dmin * mn;
 

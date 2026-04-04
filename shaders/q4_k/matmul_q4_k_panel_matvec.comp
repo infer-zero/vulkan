@@ -42,7 +42,7 @@ shared float tmpsh[NUM_ROWS][4];
 
 // Branchless 6-bit scale/min unpacking for sub-block 0-7.
 // Computes both paths and selects with ternary (predicated move, no warp divergence).
-void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = sub_block & 3u;
     uint shift = j4 * 8u;
     // Both paths computed unconditionally
@@ -108,7 +108,7 @@ void main() {
             float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
 
             float sc, mn;
-            unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+            unpackScaleMin(sub_block, h1, h2, h3, sc, mn);
 
             float d_sc = d * sc;
             float dmin_mn = dmin * mn;

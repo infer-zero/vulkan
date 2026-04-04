@@ -39,6 +39,7 @@ layout(push_constant) uniform PC {
 // Shared memory for KV tiles: [TILE_KV x 64] packed uint32 each (max head_dim=128, 64 packed pairs)
 shared uint k_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
 shared uint v_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
+                                    // Total: 32 KB
 
 // Unpack 2 BF16 values from a packed uint32
 void unpackBf16Pair(uint packed, out float v0, out float v1) {

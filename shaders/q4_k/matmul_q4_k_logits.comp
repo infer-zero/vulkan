@@ -25,9 +25,10 @@ layout(push_constant) uniform Params {
 
 shared float input_tile[TILE_K];
 shared float partial_sums[512];
+// Total: ~3 KB
 
 // Unpack 6-bit scale and min for a given sub-block index (0-7).
-void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = sub_block & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -91,14 +92,14 @@ void main() {
             // Sub-block 2*group: low nibbles (elements group*64 .. group*64+31)
             uint sb_lo = group * 2u;
             float sc_lo, mn_lo;
-            unpack_scale_min(sb_lo, h1, h2, h3, sc_lo, mn_lo);
+            unpackScaleMin(sb_lo, h1, h2, h3, sc_lo, mn_lo);
             float d_sc_lo = d * sc_lo;
             float dmin_mn_lo = dmin * mn_lo;
 
             // Sub-block 2*group+1: high nibbles (elements group*64+32 .. group*64+63)
             uint sb_hi = group * 2u + 1u;
             float sc_hi, mn_hi;
-            unpack_scale_min(sb_hi, h1, h2, h3, sc_hi, mn_hi);
+            unpackScaleMin(sb_hi, h1, h2, h3, sc_hi, mn_hi);
             float d_sc_hi = d * sc_hi;
             float dmin_mn_hi = dmin * mn_hi;
 

@@ -42,8 +42,9 @@ shared float16_t A_tile[TILE_M * A_STRIDE];
 shared float16_t G_tile[TILE_N * B_STRIDE];
 shared float16_t U_tile[TILE_N * B_STRIDE];
 shared float scratch[8 * 256];
+// Total: ~33 KB
 
-void unpack_scale_min(uint j, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint j, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = j & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -67,7 +68,7 @@ void unpack_scale_min(uint j, uint h1, uint h2, uint h3, out float sc, out float
     float _d = unpackHalf2x16(_h0 & 0xFFFFu).x;                                     \
     float _dmin = unpackHalf2x16((_h0 >> 16u) & 0xFFFFu).x;                         \
     float _sc, _mn;                                                                  \
-    unpack_scale_min(sub_block_in_sb, _h1, _h2, _h3, _sc, _mn);                     \
+    unpackScaleMin(sub_block_in_sb, _h1, _h2, _h3, _sc, _mn);                     \
     float _dsc = _d * _sc;                                                           \
     float _dmn = _dmin * _mn;                                                        \
     uint _db = panel * panel_stride + header_section_size                             \

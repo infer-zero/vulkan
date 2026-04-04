@@ -32,7 +32,7 @@ layout(push_constant) uniform Params {
 #define PANEL_N 128
 #define Q8_BLOCK_SIZE 34
 
-shared float tmpsh[NUM_ROWS][4];
+shared float tmpsh[NUM_ROWS][4];  // 2 x 4 = 32 B
 
 void main() {
     uint tid = gl_LocalInvocationID.x;

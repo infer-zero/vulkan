@@ -1,10 +1,15 @@
 #version 450
 
+// Mixture-of-experts gating: softmax or sigmoid over router logits, then
+// top-k expert selection with optional renormalization.
+// All 256 threads participate in parallel softmax/sigmoid reduction.
+// Thread 0 performs sequential top-k selection after gating.
+
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer readonly RouterLogits { float router_logits[]; };
-layout(set = 0, binding = 1) buffer ExpertIndices { uint expert_indices[]; };
-layout(set = 0, binding = 2) buffer ExpertWeights { float expert_weights[]; };
+layout(set = 0, binding = 1) buffer writeonly ExpertIndices { uint expert_indices[]; };
+layout(set = 0, binding = 2) buffer writeonly ExpertWeights { float expert_weights[]; };
 #ifdef HAS_BIAS
 layout(set = 0, binding = 3) buffer readonly ExpertBias { float expert_bias[]; };
 #endif
@@ -21,9 +26,10 @@ layout(push_constant) uniform Params {
 #endif
 };
 
-shared float logits[256]; // max 256 experts
+shared float logits[256]; // 1 KB, max 256 experts
 shared uint indices[16];  // max 16 top-k
 shared float weights[16]; // max 16 top-k
+                           // Total: ~1.1 KB
 
 void main() {
     uint tid = gl_LocalInvocationID.x;

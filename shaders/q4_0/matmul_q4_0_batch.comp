@@ -1,6 +1,6 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
-#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_control_flow_attributes : enable
 
 // Tiled GEMM: C[M,N] = A[M,K] x B^T[N,K]
 // B = weight matrix (Q4_0 panel-interleaved, [N x K/32 blocks])
@@ -32,8 +32,9 @@ layout(push_constant) uniform Params {
     uint batch_size;
 };
 
-shared float A_tile[TILE_M * A_STRIDE];   // 64 x 33
-shared float B_tile[TILE_N * B_STRIDE];   // 128 x 33
+shared float A_tile[TILE_M * A_STRIDE];   // 64 x 33 = 8.3 KB
+shared float B_tile[TILE_N * B_STRIDE];   // 128 x 33 = 16.5 KB
+                                           // Total: ~25 KB
 
 void main() {
     uint tid = gl_LocalInvocationID.x;

@@ -28,8 +28,9 @@ layout(push_constant) uniform Params {
 
 shared float gate_sh[NUM_ROWS][4];
 shared float up_sh[NUM_ROWS][4];
+// Total: ~64 B
 
-void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = sub_block & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -109,7 +110,7 @@ void main() {
                 float d = unpackHalf2x16(h0 & 0xFFFFu).x;
                 float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
                 float sc, mn;
-                unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+                unpackScaleMin(sub_block, h1, h2, h3, sc, mn);
 
                 uint data_off = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q4_K_DATA_BYTES / 4);
                 uint word_off = data_off + byte_offset_in_qs / 4u;
@@ -130,7 +131,7 @@ void main() {
                 float d = unpackHalf2x16(h0 & 0xFFFFu).x;
                 float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
                 float sc, mn;
-                unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+                unpackScaleMin(sub_block, h1, h2, h3, sc, mn);
 
                 uint data_off = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q4_K_DATA_BYTES / 4);
                 uint word_off = data_off + byte_offset_in_qs / 4u;

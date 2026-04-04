@@ -38,7 +38,7 @@ layout(push_constant) uniform Params {
 
 shared float tmpsh[NUM_ROWS][4];
 
-void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = sub_block & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -122,7 +122,7 @@ void main() {
             float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
 
             float sc, mn;
-            unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+            unpackScaleMin(sub_block, h1, h2, h3, sc, mn);
 
             // Read weight data
             uint data_section_base = panel_base_u32 + header_section_u32;

@@ -41,9 +41,10 @@ layout(push_constant) uniform Params {
 
 shared float A_tile[TILE_M * A_STRIDE];   // 64 x 33
 shared float B_tile[TILE_N * B_STRIDE];   // 128 x 33
+// Total: ~99 KB
 
 // Unpack 6-bit scale and min for a given sub-block index (0-7).
-void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
     uint j4 = sub_block & 3u;
     uint shift = j4 * 8u;
     uint sc_lo = (h1 >> shift) & 0x3Fu;
@@ -114,7 +115,7 @@ void main() {
                 float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
 
                 float sc, mn;
-                unpack_scale_min(sub_block_in_sb, h1, h2, h3, sc, mn);
+                unpackScaleMin(sub_block_in_sb, h1, h2, h3, sc, mn);
                 float d_sc = d * sc;
                 float dmin_mn = dmin * mn;
 
