@@ -1,0 +1,329 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+// INT8 cooperative matrix GEMM with fused SiLU+Hadamard for Q4_K weights.
+// Asymmetric dequant with sum-correction: acc += a_sc * (d*sc*mma - dmin*m*a_sum)
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 32
+
+#define SG_ROWS 2
+#define SG_COLS 4
+#define SG_TILE_M 32
+#define SG_TILE_N 32
+
+#define PANEL_N 128
+#define Q4_K_BLOCK_SIZE 144
+#define Q4_K_HEADER_BYTES 16
+#define Q4_K_DATA_BYTES 128
+#define A_BLOCK_SIZE  36
+
+#define mat_a_i8  coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
+#define mat_b_i8  coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
+#define mat_s32   coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define mat_f32   coopmat<float,   gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { int8_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float A_scales[TILE_M];
+shared float A_sums[TILE_M];
+shared float G_d_sc[TILE_N];
+shared float G_dmin_m[TILE_N];
+shared float U_d_sc[TILE_N];
+shared float U_dmin_m[TILE_N];
+shared int8_t G_i8[TILE_N * TILE_K];
+shared int8_t U_i8[TILE_N * TILE_K];
+shared float scratch[8 * 256];
+
+// Unpack Q4_K header scales for a sub-block
+void unpackQ4KScales(uint h0, uint h1, uint h2, uint h3, uint sub_block_in_sb,
+                     out float d_sc, out float dmin_m) {
+    float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+    float dmin = unpackHalf2x16(h0 >> 16u).x;
+    uint sc, mn;
+    if (sub_block_in_sb < 4u) {
+        sc = (h1 >> (sub_block_in_sb * 8u)) & 0x3Fu;
+        mn = (h2 >> (sub_block_in_sb * 8u)) & 0x3Fu;
+    } else {
+        uint i = sub_block_in_sb - 4u;
+        sc = ((h3 >> (i * 8u)) & 0x0Fu) | (((h1 >> (i * 8u + 6u)) & 0x3u) << 4u);
+        mn = ((h3 >> (i * 8u + 4u)) & 0x0Fu) | (((h2 >> (i * 8u + 6u)) & 0x3u) << 4u);
+    }
+    d_sc = d * float(sc);
+    dmin_m = dmin * float(mn);
+}
+
+// Unpack Q4_K nibbles to int8 in shared memory
+void unpackQ4KNibbles(uint data_base, bool is_high, uint dst_base, bool is_gate) {
+    for (uint k = 0; k < 8; k++) {
+        uint packed = is_gate ? gate_data[data_base + k] : up_data[data_base + k];
+        int8_t v0, v1, v2, v3;
+        if (is_high) {
+            v0 = int8_t((packed >> 4u) & 0xFu);  v1 = int8_t((packed >> 12u) & 0xFu);
+            v2 = int8_t((packed >> 20u) & 0xFu); v3 = int8_t((packed >> 28u) & 0xFu);
+        } else {
+            v0 = int8_t(packed & 0xFu);           v1 = int8_t((packed >> 8u) & 0xFu);
+            v2 = int8_t((packed >> 16u) & 0xFu);  v3 = int8_t((packed >> 24u) & 0xFu);
+        }
+        if (is_gate) {
+            G_i8[dst_base + k*4+0] = v0; G_i8[dst_base + k*4+1] = v1;
+            G_i8[dst_base + k*4+2] = v2; G_i8[dst_base + k*4+3] = v3;
+        } else {
+            U_i8[dst_base + k*4+0] = v0; U_i8[dst_base + k*4+1] = v1;
+            U_i8[dst_base + k*4+2] = v2; U_i8[dst_base + k*4+3] = v3;
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_lane = gl_SubgroupInvocationID;
+
+    uint wg_m = gl_WorkGroupID.y;
+    uint wg_n = gl_WorkGroupID.x;
+
+    uint sg_row = sg_id / SG_COLS;
+    uint sg_col = sg_id % SG_COLS;
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint sg_m_base = sg_row * SG_TILE_M;
+    uint sg_n_base = sg_col * SG_TILE_N;
+
+    uint num_super_blocks = in_dim / 256;
+    uint panel = n_base / PANEL_N;
+    uint panel_stride_u32 = num_super_blocks * PANEL_N * Q4_K_BLOCK_SIZE / 4;
+    uint header_section_u32 = num_super_blocks * PANEL_N * Q4_K_HEADER_BYTES / 4;
+
+    uint input_row_stride = (in_dim / 32) * A_BLOCK_SIZE;
+
+    // ─── Precompute row/col index tables ───
+    uint soff = sg_id * 256;
+    mat_f32 row_idx, col_idx;
+
+    for (uint i = sg_lane; i < 256; i += 32)
+        scratch[soff + i] = float(i / 16);
+    subgroupMemoryBarrierShared();
+    coopMatLoad(row_idx, scratch, soff, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    for (uint i = sg_lane; i < 256; i += 32)
+        scratch[soff + i] = float(i % 16);
+    subgroupMemoryBarrierShared();
+    coopMatLoad(col_idx, scratch, soff, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    uint elem_count = row_idx.length();
+    uint r_tab[8], c_tab[8];
+    for (uint e = 0; e < elem_count; e++) {
+        r_tab[e] = uint(row_idx[e]);
+        c_tab[e] = uint(col_idx[e]);
+    }
+
+    // Dual accumulators
+    mat_f32 g00 = mat_f32(0.0), g01 = mat_f32(0.0);
+    mat_f32 g10 = mat_f32(0.0), g11 = mat_f32(0.0);
+    mat_f32 u00 = mat_f32(0.0), u01 = mat_f32(0.0);
+    mat_f32 u10 = mat_f32(0.0), u11 = mat_f32(0.0);
+
+    uint total_sub_blocks = num_super_blocks * 8;
+    for (uint sb_idx = 0; sb_idx < total_sub_blocks; sb_idx++) {
+        uint super_block = sb_idx / 8;
+        uint sub_block_in_sb = sb_idx % 8;
+        uint a_block_idx = sb_idx;
+
+        // ─── Load A scales + sums ───
+        if (tid < TILE_M) {
+            uint gm = m_base + tid;
+            if (gm < batch_size) {
+                uint sb_a = gm * input_row_stride + a_block_idx * A_BLOCK_SIZE;
+                uint b0 = uint(input_data[sb_a]) & 0xFFu;
+                uint b1 = uint(input_data[sb_a+1]) & 0xFFu;
+                uint b2 = uint(input_data[sb_a+2]) & 0xFFu;
+                uint b3 = uint(input_data[sb_a+3]) & 0xFFu;
+                A_scales[tid] = uintBitsToFloat(b0 | (b1<<8u) | (b2<<16u) | (b3<<24u));
+                int asum = 0;
+                for (uint k = 0; k < 32; k++) asum += int(input_data[sb_a + 4 + k]);
+                A_sums[tid] = float(asum);
+            } else {
+                A_scales[tid] = 0.0;
+                A_sums[tid] = 0.0;
+            }
+        }
+
+        // ─── Load Gate and Up tiles ───
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint header_base = panel * panel_stride_u32 + super_block * PANEL_N * Q4_K_HEADER_BYTES / 4 + col * Q4_K_HEADER_BYTES / 4;
+
+                // Gate header
+                uint gh0 = gate_data[header_base]; uint gh1 = gate_data[header_base+1];
+                uint gh2 = gate_data[header_base+2]; uint gh3 = gate_data[header_base+3];
+                float g_dsc, g_dm;
+                unpackQ4KScales(gh0, gh1, gh2, gh3, sub_block_in_sb, g_dsc, g_dm);
+                G_d_sc[col] = g_dsc; G_dmin_m[col] = g_dm;
+
+                // Up header
+                uint uh0 = up_data[header_base]; uint uh1 = up_data[header_base+1];
+                uint uh2 = up_data[header_base+2]; uint uh3 = up_data[header_base+3];
+                float u_dsc, u_dm;
+                unpackQ4KScales(uh0, uh1, uh2, uh3, sub_block_in_sb, u_dsc, u_dm);
+                U_d_sc[col] = u_dsc; U_dmin_m[col] = u_dm;
+
+                // Unpack nibbles
+                uint group = sub_block_in_sb / 2u;
+                bool is_high = (sub_block_in_sb & 1u) != 0u;
+                uint data_base = panel * panel_stride_u32 + header_section_u32 + (super_block * PANEL_N * Q4_K_DATA_BYTES + col * Q4_K_DATA_BYTES + group * 32u) / 4u;
+                uint dst_base = col * TILE_K;
+                unpackQ4KNibbles(data_base, is_high, dst_base, true);
+                unpackQ4KNibbles(data_base, is_high, dst_base, false);
+            } else {
+                G_d_sc[col] = 0.0; G_dmin_m[col] = 0.0;
+                U_d_sc[col] = 0.0; U_dmin_m[col] = 0.0;
+                for (uint k = 0; k < 32; k++) { G_i8[col*TILE_K+k] = int8_t(0); U_i8[col*TILE_K+k] = int8_t(0); }
+            }
+        }
+
+        barrier();
+
+        // ─── Cache scales ───
+        float a_sc[2][8], a_sum_r[2][8];
+        float g_dsc_r[2][8], g_dm_r[2][8], u_dsc_r[2][8], u_dm_r[2][8];
+        for (uint e = 0; e < elem_count; e++) {
+            a_sc[0][e]     = A_scales[sg_m_base + r_tab[e]];
+            a_sc[1][e]     = A_scales[sg_m_base + 16 + r_tab[e]];
+            a_sum_r[0][e]  = A_sums[sg_m_base + r_tab[e]];
+            a_sum_r[1][e]  = A_sums[sg_m_base + 16 + r_tab[e]];
+            g_dsc_r[0][e]  = G_d_sc[sg_n_base + c_tab[e]];
+            g_dsc_r[1][e]  = G_d_sc[sg_n_base + 16 + c_tab[e]];
+            g_dm_r[0][e]   = G_dmin_m[sg_n_base + c_tab[e]];
+            g_dm_r[1][e]   = G_dmin_m[sg_n_base + 16 + c_tab[e]];
+            u_dsc_r[0][e]  = U_d_sc[sg_n_base + c_tab[e]];
+            u_dsc_r[1][e]  = U_d_sc[sg_n_base + 16 + c_tab[e]];
+            u_dm_r[0][e]   = U_dmin_m[sg_n_base + c_tab[e]];
+            u_dm_r[1][e]   = U_dmin_m[sg_n_base + 16 + c_tab[e]];
+        }
+
+        // ─── MMA ───
+        mat_a_i8 a_i8;
+        mat_b_i8 gb0, gb1, ub0, ub1;
+        mat_s32 s32_zero = mat_s32(0), s32_result;
+
+        coopMatLoad(gb0, G_i8, (sg_n_base+0)*TILE_K, TILE_K, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(gb1, G_i8, (sg_n_base+16)*TILE_K, TILE_K, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(ub0, U_i8, (sg_n_base+0)*TILE_K, TILE_K, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(ub1, U_i8, (sg_n_base+16)*TILE_K, TILE_K, gl_CooperativeMatrixLayoutColumnMajor);
+
+        uint a_row0 = m_base + sg_m_base;
+
+        // M-row 0
+        coopMatLoad(a_i8, input_data, (a_row0+0)*input_row_stride + a_block_idx*A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+
+        s32_result = coopMatMulAdd(a_i8, gb0, s32_zero);
+        for (uint e = 0; e < elem_count; e++) g00[e] += a_sc[0][e] * (g_dsc_r[0][e]*float(s32_result[e]) - g_dm_r[0][e]*a_sum_r[0][e]);
+        s32_result = coopMatMulAdd(a_i8, gb1, s32_zero);
+        for (uint e = 0; e < elem_count; e++) g01[e] += a_sc[0][e] * (g_dsc_r[1][e]*float(s32_result[e]) - g_dm_r[1][e]*a_sum_r[0][e]);
+        s32_result = coopMatMulAdd(a_i8, ub0, s32_zero);
+        for (uint e = 0; e < elem_count; e++) u00[e] += a_sc[0][e] * (u_dsc_r[0][e]*float(s32_result[e]) - u_dm_r[0][e]*a_sum_r[0][e]);
+        s32_result = coopMatMulAdd(a_i8, ub1, s32_zero);
+        for (uint e = 0; e < elem_count; e++) u01[e] += a_sc[0][e] * (u_dsc_r[1][e]*float(s32_result[e]) - u_dm_r[1][e]*a_sum_r[0][e]);
+
+        // M-row 1
+        coopMatLoad(a_i8, input_data, (a_row0+16)*input_row_stride + a_block_idx*A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+
+        s32_result = coopMatMulAdd(a_i8, gb0, s32_zero);
+        for (uint e = 0; e < elem_count; e++) g10[e] += a_sc[1][e] * (g_dsc_r[0][e]*float(s32_result[e]) - g_dm_r[0][e]*a_sum_r[1][e]);
+        s32_result = coopMatMulAdd(a_i8, gb1, s32_zero);
+        for (uint e = 0; e < elem_count; e++) g11[e] += a_sc[1][e] * (g_dsc_r[1][e]*float(s32_result[e]) - g_dm_r[1][e]*a_sum_r[1][e]);
+        s32_result = coopMatMulAdd(a_i8, ub0, s32_zero);
+        for (uint e = 0; e < elem_count; e++) u10[e] += a_sc[1][e] * (u_dsc_r[0][e]*float(s32_result[e]) - u_dm_r[0][e]*a_sum_r[1][e]);
+        s32_result = coopMatMulAdd(a_i8, ub1, s32_zero);
+        for (uint e = 0; e < elem_count; e++) u11[e] += a_sc[1][e] * (u_dsc_r[1][e]*float(s32_result[e]) - u_dm_r[1][e]*a_sum_r[1][e]);
+
+        barrier();
+    }
+
+    // ─── Write-back with fused SiLU(gate) * up ───
+    uint out_m = m_base + sg_m_base;
+    uint out_n = n_base + sg_n_base;
+    if (out_m >= batch_size || out_n >= out_dim) return;
+
+    uint sb = sg_id * 256;
+    float gate_cache[8];
+
+    // Tile (0,0)
+    coopMatStore(g00, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i*32];
+    coopMatStore(u00, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) {
+        uint idx = sg_lane + i*32; uint gm = out_m + idx/16; uint gn = out_n + idx%16;
+        if (gm < batch_size && gn < out_dim) {
+            float gate = gate_cache[i]; float silu = gate / (1.0 + exp(-gate));
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+        }
+    }
+
+    // Tile (0,1)
+    coopMatStore(g01, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i*32];
+    coopMatStore(u01, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) {
+        uint idx = sg_lane + i*32; uint gm = out_m + idx/16; uint gn = out_n + 16 + idx%16;
+        if (gm < batch_size && gn < out_dim) {
+            float gate = gate_cache[i]; float silu = gate / (1.0 + exp(-gate));
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+        }
+    }
+
+    // Tile (1,0)
+    coopMatStore(g10, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i*32];
+    coopMatStore(u10, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) {
+        uint idx = sg_lane + i*32; uint gm = out_m + 16 + idx/16; uint gn = out_n + idx%16;
+        if (gm < batch_size && gn < out_dim) {
+            float gate = gate_cache[i]; float silu = gate / (1.0 + exp(-gate));
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+        }
+    }
+
+    // Tile (1,1)
+    coopMatStore(g11, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i*32];
+    coopMatStore(u11, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    for (uint i = 0; i < 8; i++) {
+        uint idx = sg_lane + i*32; uint gm = out_m + 16 + idx/16; uint gn = out_n + 16 + idx%16;
+        if (gm < batch_size && gn < out_dim) {
+            float gate = gate_cache[i]; float silu = gate / (1.0 + exp(-gate));
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+        }
+    }
+}
