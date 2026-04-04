@@ -1,0 +1,172 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : require
+
+// Fused gate+up matvec with SiLU+Hadamard, Q4_K IDP path.
+// On-the-fly activation quantization to int8 + dotPacked4x8EXT.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_weight_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_weight_data[]; };
+layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+};
+
+#define NUM_ROWS 2
+#define PANEL_N 128
+#define Q4_K_BLOCK_SIZE 144
+#define Q4_K_HEADER_BYTES 16
+#define Q4_K_DATA_BYTES 128
+#define SUPER_BLOCK_ELEMS 256
+
+shared float gate_sh[NUM_ROWS][4];
+shared float up_sh[NUM_ROWS][4];
+
+void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+    uint j4 = sub_block & 3u;
+    uint shift = j4 * 8u;
+    uint sc_lo = (h1 >> shift) & 0x3Fu;
+    uint mn_lo = (h2 >> shift) & 0x3Fu;
+    uint sc_hi = ((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4u);
+    uint mn_hi = ((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4u);
+    sc = float((sub_block < 4u) ? sc_lo : sc_hi);
+    mn = float((sub_block < 4u) ? mn_lo : mn_hi);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * NUM_ROWS;
+
+    uint num_blocks = in_dim / SUPER_BLOCK_ELEMS;
+    uint panel_stride_u32 = num_blocks * PANEL_N * Q4_K_BLOCK_SIZE / 4;
+    uint header_section_u32 = num_blocks * PANEL_N * Q4_K_HEADER_BYTES / 4;
+
+    float gate_temp[NUM_ROWS];
+    float up_temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        gate_temp[n] = 0.0;
+        up_temp[n] = 0.0;
+    }
+
+    uint input_base = tid * 4;
+
+    for (uint col = tid * 8; col < in_dim; col += 1024) {
+        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
+        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
+        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
+        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
+        input_base += 512;
+
+        // On-the-fly quantization to int8
+        float amax = max(max(max(abs(b01.x), abs(b01.y)), max(abs(b23.x), abs(b23.y))),
+                        max(max(abs(b45.x), abs(b45.y)), max(abs(b67.x), abs(b67.y))));
+        float a_scale = amax / 127.0;
+        float inv_scale = (amax > 0.0) ? 127.0 / amax : 0.0;
+
+        int ai0 = int(round(b01.x * inv_scale)); int ai1 = int(round(b01.y * inv_scale));
+        int ai2 = int(round(b23.x * inv_scale)); int ai3 = int(round(b23.y * inv_scale));
+        int ai4 = int(round(b45.x * inv_scale)); int ai5 = int(round(b45.y * inv_scale));
+        int ai6 = int(round(b67.x * inv_scale)); int ai7 = int(round(b67.y * inv_scale));
+
+        uint a_pack0 = (uint(ai0) & 0xFFu) | ((uint(ai1) & 0xFFu) << 8u) |
+                       ((uint(ai2) & 0xFFu) << 16u) | ((uint(ai3) & 0xFFu) << 24u);
+        uint a_pack1 = (uint(ai4) & 0xFFu) | ((uint(ai5) & 0xFFu) << 8u) |
+                       ((uint(ai6) & 0xFFu) << 16u) | ((uint(ai7) & 0xFFu) << 24u);
+
+        float a_sum_i8 = float(ai0 + ai1 + ai2 + ai3 + ai4 + ai5 + ai6 + ai7);
+
+        uint super_block_idx = col / SUPER_BLOCK_ELEMS;
+        uint elem_in_block = col % SUPER_BLOCK_ELEMS;
+        uint group = elem_in_block / 64u;
+        uint pos_in_group = elem_in_block % 64u;
+        uint is_high = (pos_in_group >= 32u) ? 1u : 0u;
+        uint sub_block = group * 2u + is_high;
+        uint byte_offset_in_qs = group * 32u + (pos_in_group & 31u);
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row >= out_dim) break;
+
+            uint panel = row / PANEL_N;
+            uint col_in_panel = row % PANEL_N;
+            uint panel_base_u32 = panel * panel_stride_u32;
+
+            uint header_off = panel_base_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q4_K_HEADER_BYTES / 4);
+
+            // Gate weights
+            {
+                uint h0 = gate_weight_data[header_off];
+                uint h1 = gate_weight_data[header_off + 1];
+                uint h2 = gate_weight_data[header_off + 2];
+                uint h3 = gate_weight_data[header_off + 3];
+                float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+                float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
+                float sc, mn;
+                unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+
+                uint data_off = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q4_K_DATA_BYTES / 4);
+                uint word_off = data_off + byte_offset_in_qs / 4u;
+                uint w0 = gate_weight_data[word_off];
+                uint w1 = gate_weight_data[word_off + 1];
+                uint nib0 = (is_high != 0u) ? ((w0 >> 4u) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu);
+                uint nib1 = (is_high != 0u) ? ((w1 >> 4u) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu);
+                int idp = dotPacked4x8EXT(int(a_pack0), int(nib0)) + dotPacked4x8EXT(int(a_pack1), int(nib1));
+                gate_temp[n] += a_scale * (d * sc * float(idp) - dmin * mn * a_sum_i8);
+            }
+
+            // Up weights
+            {
+                uint h0 = up_weight_data[header_off];
+                uint h1 = up_weight_data[header_off + 1];
+                uint h2 = up_weight_data[header_off + 2];
+                uint h3 = up_weight_data[header_off + 3];
+                float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+                float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
+                float sc, mn;
+                unpack_scale_min(sub_block, h1, h2, h3, sc, mn);
+
+                uint data_off = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q4_K_DATA_BYTES / 4);
+                uint word_off = data_off + byte_offset_in_qs / 4u;
+                uint w0 = up_weight_data[word_off];
+                uint w1 = up_weight_data[word_off + 1];
+                uint nib0 = (is_high != 0u) ? ((w0 >> 4u) & 0x0F0F0F0Fu) : (w0 & 0x0F0F0F0Fu);
+                uint nib1 = (is_high != 0u) ? ((w1 >> 4u) & 0x0F0F0F0Fu) : (w1 & 0x0F0F0F0Fu);
+                int idp = dotPacked4x8EXT(int(a_pack0), int(nib0)) + dotPacked4x8EXT(int(a_pack1), int(nib1));
+                up_temp[n] += a_scale * (d * sc * float(idp) - dmin * mn * a_sum_i8);
+            }
+        }
+    }
+
+    // Reduce
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        gate_temp[n] = subgroupAdd(gate_temp[n]);
+        up_temp[n] = subgroupAdd(up_temp[n]);
+    }
+
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            gate_sh[n][gl_SubgroupID] = gate_temp[n];
+            up_sh[n][gl_SubgroupID] = up_temp[n];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row < out_dim) {
+                float g = gate_sh[n][0] + gate_sh[n][1] + gate_sh[n][2] + gate_sh[n][3];
+                float u = up_sh[n][0] + up_sh[n][1] + up_sh[n][2] + up_sh[n][3];
+                float silu_g = g / (1.0 + exp(-g));
+                output_data[row] = float16_t(silu_g * u);
+            }
+        }
+    }
+}
