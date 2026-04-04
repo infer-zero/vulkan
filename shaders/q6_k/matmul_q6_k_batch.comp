@@ -1,0 +1,191 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : require
+
+// Tiled GEMM: C[M,N] = A[M,K] x B^T[N,K]
+// B = weight matrix (Q6_K panel-interleaved, [N x K/256 super-blocks])
+// C = output activations (f16, row-major [M x N])
+// M = batch_size, N = out_dim, K = in_dim
+//
+// Panel-interleaved layout (PANEL_N=128):
+//   Per panel: [header: num_sblocks * PANEL_N * 18B][data: num_sblocks * PANEL_N * 192B]
+//   Header per row per super-block: scales[16]:i8 + d[2]:f16 = 18 bytes
+//   Data per row per super-block:   ql[128] + qh[64]         = 192 bytes
+//
+// TILE_K=32 processes 1/8 of a 256-element super-block per iteration.
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 32       // 256 / 8 = 32 elements per tile
+#define WG_M 8          // threads in M direction
+#define WG_N 32         // threads in N direction (WG_M x WG_N = 256)
+#define THREAD_M 8      // TILE_M / WG_M
+#define THREAD_N 4      // TILE_N / WG_N
+#define PANEL_N 128
+#define Q6_K_HEADER_BYTES 18
+#define Q6_K_DATA_BYTES 192
+#define Q6_K_TOTAL_BYTES 210
+#define Q6_K_ELEMS 256
+
+#define A_STRIDE 33     // TILE_K + 1 for bank conflict avoidance
+#define B_STRIDE 33
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float A_tile[TILE_M * A_STRIDE];   // 64 x 33
+shared float B_tile[TILE_N * B_STRIDE];   // 128 x 33
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;   // output tile index (N direction)
+    uint wg_m = gl_WorkGroupID.y;   // batch tile index (M direction)
+
+    uint thread_m = tid / WG_N;     // 0..7
+    uint thread_n = tid % WG_N;     // 0..31
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint num_sblocks = in_dim / Q6_K_ELEMS;
+    uint num_tiles = num_sblocks * 8;   // 8 tiles of 32 elements per super-block
+    uint panel = n_base / PANEL_N;
+    uint panel_stride_bytes = num_sblocks * PANEL_N * Q6_K_TOTAL_BYTES;
+    uint header_section_bytes = num_sblocks * PANEL_N * Q6_K_HEADER_BYTES;
+
+    // Accumulators: THREAD_M x THREAD_N = 8 x 4 = 32
+    float acc[THREAD_M * THREAD_N];
+    [[unroll]] for (uint i = 0; i < THREAD_M * THREAD_N; i++) acc[i] = 0.0;
+
+    for (uint tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        uint k_base = tile_idx * TILE_K;
+
+        // Load A tile: TILE_M x TILE_K = 64 x 32 = 2048 elements, 256 threads -> 8 each
+        [[unroll]] for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+        }
+
+        // Load B tile: 128 threads each dequantize 32 Q6_K values for one output row.
+        // Tile maps to a specific region within a 256-element super-block:
+        //   super_block = tile_idx / 8
+        //   tile_in_block = tile_idx % 8 (0..7)
+        //   group = tile_in_block / 4 (0 or 1)
+        //   quadrant = tile_in_block % 4 (0..3 -> q1/q2/q3/q4)
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint sblock = tile_idx / 8;
+                uint tile_in_block = tile_idx % 8;
+                uint group = tile_in_block / 4;
+                uint quadrant = tile_in_block % 4;
+
+                // Header addressing (byte-level)
+                uint hdr_byte = panel * panel_stride_bytes + sblock * PANEL_N * Q6_K_HEADER_BYTES
+                    + col * Q6_K_HEADER_BYTES;
+
+                // Read d (f16 at byte offset 16 within 18-byte header)
+                uint d_word = weight_data[(hdr_byte + 16) >> 2];
+                uint d_shift = ((hdr_byte + 16) & 2u) * 8u;
+                float d_val = unpackHalf2x16((d_word >> d_shift) & 0xFFFFu).x;
+
+                // Data addressing (byte-level, always 4-byte aligned since col*192 is multiple of 4)
+                uint dat_byte = panel * panel_stride_bytes + header_section_bytes
+                    + sblock * PANEL_N * Q6_K_DATA_BYTES + col * Q6_K_DATA_BYTES;
+
+                // ql/qh offsets within data section:
+                //   ql: group*64 + ((quadrant&1)?32:0) + l, for l=0..31
+                //   qh: 128 + group*32 + l, for l=0..31
+                uint ql_byte_off = dat_byte + group * 64 + ((quadrant & 1) != 0 ? 32u : 0u);
+                uint qh_byte_off = dat_byte + 128 + group * 32;
+                uint ql_nibble_shift = (quadrant >= 2) ? 4u : 0u;
+                uint qh_bit_shift = quadrant * 2;
+
+                // Scale indices: is=0 for l=0..15, is=1 for l=16..31
+                uint sc_base_idx = group * 8 + quadrant * 2;
+                uint sc0_byte = hdr_byte + sc_base_idx;
+                uint sc1_byte = hdr_byte + sc_base_idx + 1;
+                float sc0 = float(bitfieldExtract(int(weight_data[sc0_byte >> 2]),
+                    int((sc0_byte & 3u) * 8u), 8));
+                float sc1 = float(bitfieldExtract(int(weight_data[sc1_byte >> 2]),
+                    int((sc1_byte & 3u) * 8u), 8));
+
+                float scale_lo = d_val * sc0;  // for l=0..15
+                float scale_hi = d_val * sc1;  // for l=16..31
+
+                // ql and qh are at known-aligned byte offsets (multiples of 4):
+                //   ql_byte_off: col*192 is mult of 4, group*64 is mult of 4,
+                //                (quadrant&1)*32 is mult of 4 -> always aligned
+                //   qh_byte_off: col*192 + 128 + group*32 -> always aligned
+                uint ql_u32 = ql_byte_off >> 2;
+                uint qh_u32 = qh_byte_off >> 2;
+
+                // Dequantize 32 values: read 8 uint32 from ql (32 bytes), 8 from qh (32 bytes)
+                [[unroll]] for (uint w = 0; w < 8; w++) {
+                    uint ql_word = weight_data[ql_u32 + w];
+                    uint qh_word = weight_data[qh_u32 + w];
+                    uint base_l = w * 4;
+                    float scale = (base_l < 16) ? scale_lo : scale_hi;
+
+                    [[unroll]] for (uint b = 0; b < 4; b++) {
+                        uint byte_shift = b * 8;
+                        uint ql_nibble = (ql_word >> (byte_shift + ql_nibble_shift)) & 0xFu;
+                        uint qh_bits = (qh_word >> (byte_shift + qh_bit_shift)) & 3u;
+                        int q_val = int(ql_nibble | (qh_bits << 4)) - 32;
+                        B_tile[col * B_STRIDE + base_l + b] = scale * float(q_val);
+                    }
+                }
+            } else {
+                [[unroll]] for (uint k = 0; k < 32; k++) {
+                    B_tile[col * B_STRIDE + k] = 0.0;
+                }
+            }
+        }
+
+        barrier();
+
+        // Compute outer products over the K tile
+        [[unroll]] for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k];
+            }
+            float b_vals[THREAD_N];
+            [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                b_vals[j] = B_tile[(thread_n * THREAD_N + j) * B_STRIDE + k];
+            }
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                    acc[i * THREAD_N + j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write results
+    [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                output_data[gm * out_dim + gn] = float16_t(acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}

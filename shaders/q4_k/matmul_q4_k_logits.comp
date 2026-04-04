@@ -1,0 +1,137 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Coalesced matvec for logits with K-splitting. Q4_K panel-interleaved weights, F32 output.
+
+layout(local_size_x = 512) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+#define PANEL_N 128
+#define Q4_K_BLOCK_SIZE 144
+#define Q4_K_HEADER_BYTES 16
+#define Q4_K_DATA_BYTES 128
+#define SUPER_BLOCK_ELEMS 256
+#define TILE_K 256
+#define K_SPLITS 4
+
+shared float input_tile[TILE_K];
+shared float partial_sums[512];
+
+// Unpack 6-bit scale and min for a given sub-block index (0-7).
+void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+    if (sub_block < 4) {
+        uint shift = sub_block * 8u;
+        sc = float((h1 >> shift) & 0x3Fu);
+        mn = float((h2 >> shift) & 0x3Fu);
+    } else {
+        uint idx = sub_block - 4u;
+        uint shift = idx * 8u;
+        sc = float(((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4));
+        mn = float(((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4));
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint panel = gl_WorkGroupID.x;
+    uint row_in_panel = tid & 127u;
+    uint lane = tid >> 7u;
+    uint global_row = panel * PANEL_N + row_in_panel;
+
+    float sum = 0.0;
+    bool valid_row = global_row < out_dim;
+
+    uint num_blocks = in_dim / SUPER_BLOCK_ELEMS;
+    uint panel_stride = num_blocks * PANEL_N * Q4_K_BLOCK_SIZE;
+    uint header_section_size = num_blocks * PANEL_N * Q4_K_HEADER_BYTES;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        if (tid < TILE_K) {
+            uint load_idx = tile_start + tid;
+            input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+        }
+        barrier();
+
+        if (valid_row) {
+            // TILE_K=256 = 1 super-block. K_SPLITS=4, so each lane processes 1/4 of the super-block.
+            // 256 elements / 4 lanes = 64 elements per lane = 2 sub-blocks per lane.
+            uint super_block_idx = tile_start / SUPER_BLOCK_ELEMS;
+
+            // Read header for this row and super-block
+            uint header_byte = panel * panel_stride + (super_block_idx * PANEL_N + row_in_panel) * Q4_K_HEADER_BYTES;
+            uint header_word = header_byte >> 2;
+            uint h0 = weight_data[header_word];
+            uint h1 = weight_data[header_word + 1];
+            uint h2 = weight_data[header_word + 2];
+            uint h3 = weight_data[header_word + 3];
+
+            float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+            float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
+
+            uint data_byte = panel * panel_stride + header_section_size
+                + (super_block_idx * PANEL_N + row_in_panel) * Q4_K_DATA_BYTES;
+
+            // Each lane processes 2 groups (64 elements each group has 2 sub-blocks of 32)
+            // lane 0: groups 0-1 (sub-blocks 0-3), lane 1: groups 2-3 (sub-blocks 4-7)
+            // lane 2: groups 0-1 of next super-block... but TILE_K=256=1 super-block,
+            // so lanes 2,3 process same super-block different groups? No -- we have 4 lanes
+            // and 4 groups of 64 elements = 8 sub-blocks.
+            // lane 0: group 0 (elements 0-63), lane 1: group 1 (elements 64-127),
+            // lane 2: group 2 (elements 128-191), lane 3: group 3 (elements 192-255).
+            uint group = lane;
+            uint base_input = group * 64u;
+
+            // Sub-block 2*group: low nibbles (elements group*64 .. group*64+31)
+            uint sb_lo = group * 2u;
+            float sc_lo, mn_lo;
+            unpack_scale_min(sb_lo, h1, h2, h3, sc_lo, mn_lo);
+            float d_sc_lo = d * sc_lo;
+            float dmin_mn_lo = dmin * mn_lo;
+
+            // Sub-block 2*group+1: high nibbles (elements group*64+32 .. group*64+63)
+            uint sb_hi = group * 2u + 1u;
+            float sc_hi, mn_hi;
+            unpack_scale_min(sb_hi, h1, h2, h3, sc_hi, mn_hi);
+            float d_sc_hi = d * sc_hi;
+            float dmin_mn_hi = dmin * mn_hi;
+
+            // Data offset for this group: group*32 bytes within qs
+            uint qs_byte = data_byte + group * 32u;
+            uint base_word = qs_byte >> 2;
+
+            float block_sum = 0.0;
+            // 8 uint32 words = 32 bytes = 32 low nibbles + 32 high nibbles
+            for (uint k = 0; k < 8; k++) {
+                uint packed = weight_data[base_word + k];
+                uint elem = k * 4;
+                // Low nibbles: elements base_input + elem .. base_input + elem + 3
+                block_sum += input_tile[base_input + elem + 0] * (d_sc_lo * float(packed & 0xFu) - dmin_mn_lo);
+                block_sum += input_tile[base_input + elem + 1] * (d_sc_lo * float((packed >> 8u) & 0xFu) - dmin_mn_lo);
+                block_sum += input_tile[base_input + elem + 2] * (d_sc_lo * float((packed >> 16u) & 0xFu) - dmin_mn_lo);
+                block_sum += input_tile[base_input + elem + 3] * (d_sc_lo * float((packed >> 24u) & 0xFu) - dmin_mn_lo);
+                // High nibbles: elements base_input + 32 + elem .. base_input + 32 + elem + 3
+                block_sum += input_tile[base_input + 32 + elem + 0] * (d_sc_hi * float((packed >> 4u) & 0xFu) - dmin_mn_hi);
+                block_sum += input_tile[base_input + 32 + elem + 1] * (d_sc_hi * float((packed >> 12u) & 0xFu) - dmin_mn_hi);
+                block_sum += input_tile[base_input + 32 + elem + 2] * (d_sc_hi * float((packed >> 20u) & 0xFu) - dmin_mn_hi);
+                block_sum += input_tile[base_input + 32 + elem + 3] * (d_sc_hi * float((packed >> 28u) & 0xFu) - dmin_mn_hi);
+            }
+            sum += block_sum;
+        }
+        barrier();
+    }
+
+    partial_sums[tid] = sum;
+    barrier();
+    if (lane == 0u && valid_row) {
+        output_data[global_row] = partial_sums[tid] + partial_sums[tid + 128] + partial_sums[tid + 256] + partial_sums[tid + 384];
+    }
+}
