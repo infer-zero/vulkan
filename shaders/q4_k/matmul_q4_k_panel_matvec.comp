@@ -40,19 +40,18 @@ layout(push_constant) uniform Params {
 
 shared float tmpsh[NUM_ROWS][4];
 
-// Unpack 6-bit scale and min for a given sub-block index (0-7) from header words.
-// h1 = header word containing scales_raw[0..3], h2 = scales_raw[4..7], h3 = scales_raw[8..11].
+// Branchless 6-bit scale/min unpacking for sub-block 0-7.
+// Computes both paths and selects with ternary (predicated move, no warp divergence).
 void unpack_scale_min(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
-    if (sub_block < 4) {
-        uint shift = sub_block * 8u;
-        sc = float((h1 >> shift) & 0x3Fu);
-        mn = float((h2 >> shift) & 0x3Fu);
-    } else {
-        uint idx = sub_block - 4u;
-        uint shift = idx * 8u;
-        sc = float(((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4));
-        mn = float(((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4));
-    }
+    uint j4 = sub_block & 3u;
+    uint shift = j4 * 8u;
+    // Both paths computed unconditionally
+    uint sc_lo = (h1 >> shift) & 0x3Fu;
+    uint mn_lo = (h2 >> shift) & 0x3Fu;
+    uint sc_hi = ((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4u);
+    uint mn_hi = ((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4u);
+    sc = float((sub_block < 4u) ? sc_lo : sc_hi);
+    mn = float((sub_block < 4u) ? mn_lo : mn_hi);
 }
 
 void main() {

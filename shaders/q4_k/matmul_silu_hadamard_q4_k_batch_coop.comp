@@ -44,14 +44,14 @@ shared float16_t U_tile[TILE_N * B_STRIDE];
 shared float scratch[8 * 256];
 
 void unpack_scale_min(uint j, uint h1, uint h2, uint h3, out float sc, out float mn) {
-    if (j < 4u) {
-        sc = float((h1 >> (j * 8u)) & 0x3Fu);
-        mn = float((h2 >> (j * 8u)) & 0x3Fu);
-    } else {
-        uint shift = (j - 4u) * 8u;
-        sc = float(((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4));
-        mn = float(((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4));
-    }
+    uint j4 = j & 3u;
+    uint shift = j4 * 8u;
+    uint sc_lo = (h1 >> shift) & 0x3Fu;
+    uint mn_lo = (h2 >> shift) & 0x3Fu;
+    uint sc_hi = ((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4u);
+    uint mn_hi = ((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4u);
+    sc = float((j < 4u) ? sc_lo : sc_hi);
+    mn = float((j < 4u) ? mn_lo : mn_hi);
 }
 
 // Inline dequant macro for gate/up weight buffers to shared f16 tiles.
