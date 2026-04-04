@@ -574,6 +574,7 @@ pub const VulkanDevice = struct {
         }
         self.vkd.destroyBuffer(self.device, buf.buffer, null);
         self.vkd.freeMemory(self.device, buf.memory, null);
+        self.allocated_bytes -|= buf.size;
     }
 
     pub fn uploadToBuffer(self: *Self, dst: GpuBuffer, data: []const u8) !void {
