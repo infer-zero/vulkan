@@ -193,6 +193,27 @@ pub fn compileShader(
     return spv_output;
 }
 
+/// Compile a single shader from any source path and register it as `@import("spv_{name}")`.
+/// Use for model-specific shaders or shared shaders with custom defines not covered by addShaders.
+pub fn addShader(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    vk_dep: *std.Build.Dependency,
+    source: std.Build.LazyPath,
+    name: []const u8,
+    target_env: TargetEnv,
+    defines: []const []const u8,
+) void {
+    const shaderc_dep = vk_dep.builder.dependency("shaderc", .{ .optimize = .ReleaseFast });
+    const glslc = shaderc_dep.artifact("glslc");
+    const cmd = b.addRunArtifact(glslc);
+    cmd.addArgs(&.{ target_env.flag(), "-o" });
+    const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{name}));
+    for (defines) |def| cmd.addArg(def);
+    cmd.addFileArg(source);
+    mod.addAnonymousImport(b.fmt("spv_{s}", .{name}), .{ .root_source_file = spv });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
