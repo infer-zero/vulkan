@@ -21,6 +21,7 @@ pub const ShaderGroups = struct {
     q6_k: bool = false,
     moe_bf16: bool = false,
     moe_q8_0: bool = false,
+    moe_q4_k: bool = false,
 };
 
 const Shader = struct {
@@ -144,6 +145,13 @@ const moe_q8_0_shaders = [_]Shader{
     shader("shaders/moe", "moe_softmax_topk"),
 };
 
+const moe_q4_k_shaders = [_]Shader{
+    shader("shaders/moe", "moe_matmul_q4_k_panel_matvec"),
+    shader("shaders/moe", "moe_matmul_silu_hadamard_q4_k_panel_matvec"),
+    shader("shaders/moe", "moe_scaled_add"),
+    shader("shaders/moe", "moe_softmax_topk"),
+};
+
 /// Add pre-defined shader groups to a module as anonymous SPIR-V imports.
 /// Each shader becomes available as `@embedFile(@import("spv_{name}"))`.
 pub fn addShaders(
@@ -161,6 +169,7 @@ pub fn addShaders(
         .{ .enabled = groups.q6_k, .shaders = &q6_k_shaders },
         .{ .enabled = groups.moe_bf16, .shaders = &moe_bf16_shaders },
         .{ .enabled = groups.moe_q8_0, .shaders = &moe_q8_0_shaders },
+        .{ .enabled = groups.moe_q4_k, .shaders = &moe_q4_k_shaders },
     };
 
     for (all_groups) |group| {
@@ -252,6 +261,7 @@ pub fn build(b: *std.Build) void {
         &q6_k_shaders,
         &moe_bf16_shaders,
         &moe_q8_0_shaders,
+        &moe_q4_k_shaders,
     };
     for (all_groups) |group| {
         for (group) |s| {
