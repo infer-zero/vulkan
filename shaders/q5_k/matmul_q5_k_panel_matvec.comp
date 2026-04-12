@@ -1,0 +1,194 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Panel-interleaved Q5_K matvec: 128 threads (4 subgroups), 2 rows per WG.
+// Weight buffer layout (panel-interleaved, PANEL_N=128):
+//   Per panel: [headers: num_blocks * PANEL_N * 16B]
+//              [qh: num_blocks * PANEL_N * 32B]
+//              [data: num_blocks * PANEL_N * 128B]
+// Q5_K super-block: 256 values in 176 bytes (16B header + 32B qh + 128B nibble data).
+// Header: d[2]:f16 + dmin[2]:f16 + scales[12]:packed_6bit
+// 8 sub-blocks of 32 elements each with independent scale/min.
+// qh: 256 bits (32 bytes), one bit per element — bit j is the 5th bit of element j.
+// Asymmetric dequant: value = d * sub_scale * (nibble | (qh_bit << 4)) - dmin * sub_min
+//
+// Variants:
+//   (none)         -> f16 output (3buf: input, weights, output)
+//   STORE_BF16_KV  -> BF16 KV cache write (3buf + dyn: input, weights, kv_cache + dynamic)
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
+#ifdef STORE_BF16_KV
+layout(set = 0, binding = 2) buffer KVCache { uint kv_cache[]; };
+layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
+#else
+layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+};
+
+#define NUM_ROWS 2
+#define PANEL_N 128
+#define Q5_K_BLOCK_SIZE 176
+#define Q5_K_HEADER_BYTES 16
+#define Q5_K_QH_BYTES 32
+#define Q5_K_DATA_BYTES 128
+#define SUPER_BLOCK_ELEMS 256
+
+shared float tmpsh[NUM_ROWS][4];
+
+// Branchless 6-bit scale/min unpacking for sub-block 0-7.
+// Computes both paths and selects with ternary (predicated move, no warp divergence).
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+    uint j4 = sub_block & 3u;
+    uint shift = j4 * 8u;
+    // Both paths computed unconditionally
+    uint sc_lo = (h1 >> shift) & 0x3Fu;
+    uint mn_lo = (h2 >> shift) & 0x3Fu;
+    uint sc_hi = ((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4u);
+    uint mn_hi = ((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4u);
+    sc = float((sub_block < 4u) ? sc_lo : sc_hi);
+    mn = float((sub_block < 4u) ? mn_lo : mn_hi);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * NUM_ROWS;
+
+    uint num_blocks = in_dim / SUPER_BLOCK_ELEMS;
+    uint panel_stride_u32 = num_blocks * PANEL_N * Q5_K_BLOCK_SIZE / 4;
+    uint header_section_u32 = num_blocks * PANEL_N * Q5_K_HEADER_BYTES / 4;
+    uint qh_section_u32 = num_blocks * PANEL_N * Q5_K_QH_BYTES / 4;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
+
+    // 128 threads x 8 elements = 1024 per iteration = 4 super-blocks
+    uint input_base = tid * 4;
+
+    for (uint col = tid * 8; col < in_dim; col += 1024) {
+        // Read 8 input f16 values as 4 packed uint32
+        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
+        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
+        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
+        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
+        input_base += 512; // 1024 / 2
+
+        // Precompute sum of input values for asymmetric min correction
+        float input_sum = b01.x + b01.y + b23.x + b23.y + b45.x + b45.y + b67.x + b67.y;
+
+        // Determine position within super-block structure
+        uint super_block_idx = col / SUPER_BLOCK_ELEMS;
+        uint elem_in_block = col % SUPER_BLOCK_ELEMS;
+        uint group = elem_in_block / 64u;
+        uint pos_in_group = elem_in_block % 64u;
+        uint is_high = (pos_in_group >= 32u) ? 1u : 0u;
+        uint sub_block = group * 2u + is_high;
+        uint byte_offset_in_qs = group * 32u + (pos_in_group & 31u);
+        uint nibble_shift = is_high * 4u;
+
+        // qh bit extraction: elem_in_block is the bit index within the 256-bit qh array.
+        // Our 8 consecutive elements start at elem_in_block. Load the uint32 word
+        // containing these 8 bits and shift to align bit 0 with our first element.
+        uint qh_word_idx = elem_in_block / 32u;
+        uint qh_bit_offset = elem_in_block % 32u;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row >= out_dim) break;
+
+            uint panel = row / PANEL_N;
+            uint col_in_panel = row % PANEL_N;
+            uint panel_base_u32 = panel * panel_stride_u32;
+
+            // Read header: 16 bytes per row per block = 4 uint32 words
+            uint header_off = panel_base_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_HEADER_BYTES / 4);
+            uint h0 = weight_data[header_off];       // d (low 16) + dmin (high 16)
+            uint h1 = weight_data[header_off + 1];   // scales_raw[0..3]
+            uint h2 = weight_data[header_off + 2];   // scales_raw[4..7]
+            uint h3 = weight_data[header_off + 3];   // scales_raw[8..11]
+
+            float d = unpackHalf2x16(h0 & 0xFFFFu).x;
+            float dmin = unpackHalf2x16((h0 >> 16u) & 0xFFFFu).x;
+
+            float sc, mn;
+            unpackScaleMin(sub_block, h1, h2, h3, sc, mn);
+
+            float d_sc = d * sc;
+            float dmin_mn = dmin * mn;
+
+            // Read qh from qh section: 32 bytes per row per block = 8 uint32 words
+            uint qh_section_base = panel_base_u32 + header_section_u32;
+            uint qh_off = qh_section_base + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_QH_BYTES / 4);
+            uint qh_word = weight_data[qh_off + qh_word_idx];
+            uint qh_bits = qh_word >> qh_bit_offset;
+
+            // Read nibble data from data section
+            uint data_section_base = panel_base_u32 + header_section_u32 + qh_section_u32;
+            uint data_off = data_section_base + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_DATA_BYTES / 4);
+            // byte_offset_in_qs is the byte offset within the 128-byte qs array
+            // We read 8 consecutive nibbles starting at byte_offset_in_qs (2 uint32 words = 8 bytes)
+            uint word_off = data_off + byte_offset_in_qs / 4u;
+            uint w0 = weight_data[word_off];
+            uint w1 = weight_data[word_off + 1];
+
+            // 5-bit dequant: (nibble | (qh_bit << 4))
+            // Factor out dmin_mn: sum(input * (d_sc * val5 - dmin_mn))
+            //   = d_sc * sum(input * val5) - dmin_mn * sum(input)
+            float val5_dot =
+                b01.x * float(((w0 >> nibble_shift) & 0xFu) | (((qh_bits      ) & 1u) << 4u)) +
+                b01.y * float(((w0 >> (8u + nibble_shift)) & 0xFu) | (((qh_bits >> 1u) & 1u) << 4u)) +
+                b23.x * float(((w0 >> (16u + nibble_shift)) & 0xFu) | (((qh_bits >> 2u) & 1u) << 4u)) +
+                b23.y * float(((w0 >> (24u + nibble_shift)) & 0xFu) | (((qh_bits >> 3u) & 1u) << 4u)) +
+                b45.x * float(((w1 >> nibble_shift) & 0xFu) | (((qh_bits >> 4u) & 1u) << 4u)) +
+                b45.y * float(((w1 >> (8u + nibble_shift)) & 0xFu) | (((qh_bits >> 5u) & 1u) << 4u)) +
+                b67.x * float(((w1 >> (16u + nibble_shift)) & 0xFu) | (((qh_bits >> 6u) & 1u) << 4u)) +
+                b67.y * float(((w1 >> (24u + nibble_shift)) & 0xFu) | (((qh_bits >> 7u) & 1u) << 4u));
+
+            temp[n] += d_sc * val5_dot - dmin_mn * input_sum;
+        }
+    }
+
+    // Reduce: subgroupAdd within each subgroup
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Cross-subgroup reduction via shared memory
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            tmpsh[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+#ifdef STORE_BF16_KV
+        uint kv_offset = dyn_position * out_dim;
+        float v0 = tmpsh[0][0] + tmpsh[0][1] + tmpsh[0][2] + tmpsh[0][3];
+        if (first_row + 1 < out_dim) {
+            float v1 = tmpsh[1][0] + tmpsh[1][1] + tmpsh[1][2] + tmpsh[1][3];
+            uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
+            kv_cache[(kv_offset + first_row) / 2] = packed;
+        } else if (first_row < out_dim) {
+            uint packed = (floatBitsToUint(v0) >> 16);
+            kv_cache[(kv_offset + first_row) / 2] = packed;
+        }
+#else
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint row = first_row + n;
+            if (row < out_dim) {
+                float result = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
+                output_data[row] = float16_t(result);
+            }
+        }
+#endif
+    }
+}

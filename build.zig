@@ -19,6 +19,7 @@ pub const ShaderGroups = struct {
     q5_0: bool = false,
     q4_0: bool = false,
     q4_k: bool = false,
+    q5_k: bool = false,
     q6_k: bool = false,
     moe_bf16: bool = false,
     moe_q8_0: bool = false,
@@ -134,6 +135,15 @@ const q4_k_shaders = [_]Shader{
     variant("shaders/q4_k", "matmul_q4_k_panel_matvec", "matmul_q4_k_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
 };
 
+const q5_k_shaders = [_]Shader{
+    shader("shaders/q5_k", "matmul_q5_k_panel_matvec"),
+    shader("shaders/q5_k", "matmul_silu_hadamard_q5_k_panel_matvec"),
+    shader("shaders/q5_k", "matmul_q5_k_batch"),
+    shader("shaders/q5_k", "matmul_silu_hadamard_q5_k_batch"),
+    // Variants
+    variant("shaders/q5_k", "matmul_q5_k_panel_matvec", "matmul_q5_k_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
+};
+
 const q6_k_shaders = [_]Shader{
     shader("shaders/q6_k", "matmul_q6_k_panel_matvec"),
     shader("shaders/q6_k", "matmul_q6_k_batch"),
@@ -177,6 +187,7 @@ pub fn addShaders(
         .{ .enabled = groups.q5_0, .shaders = &q5_0_shaders },
         .{ .enabled = groups.q4_0, .shaders = &q4_0_shaders },
         .{ .enabled = groups.q4_k, .shaders = &q4_k_shaders },
+        .{ .enabled = groups.q5_k, .shaders = &q5_k_shaders },
         .{ .enabled = groups.q6_k, .shaders = &q6_k_shaders },
         .{ .enabled = groups.moe_bf16, .shaders = &moe_bf16_shaders },
         .{ .enabled = groups.moe_q8_0, .shaders = &moe_q8_0_shaders },

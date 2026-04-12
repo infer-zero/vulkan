@@ -1,0 +1,215 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : require
+
+// Tiled GEMM with fused SiLU and Hadamard product for Q5_K weights:
+// gate[M,N] = A[M,K] x Gate^T[N,K]
+// up[M,N]   = A[M,K] x Up^T[N,K]
+// output[M,N] = SiLU(gate[M,N]) * up[M,N]
+//
+// Q5_K panel layout per panel:
+//   [headers: num_blocks * PANEL_N * 16B]
+//   [qh: num_blocks * PANEL_N * 32B]
+//   [data: num_blocks * PANEL_N * 128B]
+//
+// TILE_K = 32 matches one sub-block of 32 elements within a Q5_K super-block.
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 32
+#define WG_M 8
+#define WG_N 32
+#define THREAD_M 8
+#define THREAD_N 4
+#define PANEL_N 128
+#define Q5_K_BLOCK_SIZE 176
+#define Q5_K_HEADER_BYTES 16
+#define Q5_K_QH_BYTES 32
+#define Q5_K_DATA_BYTES 128
+#define SUPER_BLOCK_ELEMS 256
+
+#define A_STRIDE 33
+#define B_STRIDE 33
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float A_tile[TILE_M * A_STRIDE];
+shared float G_tile[TILE_N * B_STRIDE];
+shared float U_tile[TILE_N * B_STRIDE];
+// Total: ~165 KB
+
+// Unpack 6-bit scale and min for a given sub-block index (0-7).
+void unpackScaleMin(uint sub_block, uint h1, uint h2, uint h3, out float sc, out float mn) {
+    uint j4 = sub_block & 3u;
+    uint shift = j4 * 8u;
+    uint sc_lo = (h1 >> shift) & 0x3Fu;
+    uint mn_lo = (h2 >> shift) & 0x3Fu;
+    uint sc_hi = ((h3 >> shift) & 0x0Fu) | (((h1 >> (shift + 6u)) & 0x3u) << 4u);
+    uint mn_hi = ((h3 >> (shift + 4u)) & 0x0Fu) | (((h2 >> (shift + 6u)) & 0x3u) << 4u);
+    sc = float((sub_block < 4u) ? sc_lo : sc_hi);
+    mn = float((sub_block < 4u) ? mn_lo : mn_hi);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;
+    uint wg_m = gl_WorkGroupID.y;
+
+    uint thread_m = tid / WG_N;
+    uint thread_n = tid % WG_N;
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint num_super_blocks = in_dim / SUPER_BLOCK_ELEMS;
+    uint panel = n_base / PANEL_N;
+    uint panel_stride = num_super_blocks * PANEL_N * Q5_K_BLOCK_SIZE;
+    uint header_section_size = num_super_blocks * PANEL_N * Q5_K_HEADER_BYTES;
+    uint qh_section_size = num_super_blocks * PANEL_N * Q5_K_QH_BYTES;
+
+    float gate_acc[THREAD_M * THREAD_N];
+    float up_acc[THREAD_M * THREAD_N];
+    [[unroll]] for (uint i = 0; i < THREAD_M * THREAD_N; i++) {
+        gate_acc[i] = 0.0;
+        up_acc[i] = 0.0;
+    }
+
+    uint total_sub_blocks = num_super_blocks * 8u;
+
+    for (uint sb_idx = 0; sb_idx < total_sub_blocks; sb_idx++) {
+        uint k_base = sb_idx * 32u;
+
+        // Load A tile
+        [[unroll]] for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+        }
+
+        // Load Gate and Up tiles: Q5_K dequant for one sub-block (32 values)
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint super_block_idx = sb_idx / 8u;
+                uint sub_block_in_sb = sb_idx % 8u;
+                uint group = sub_block_in_sb / 2u;
+                uint is_high = sub_block_in_sb & 1u;
+                uint nibble_shift = is_high * 4u;
+
+                // Read gate header
+                uint header_byte = panel * panel_stride
+                    + (super_block_idx * PANEL_N + col) * Q5_K_HEADER_BYTES;
+                uint header_word = header_byte >> 2;
+
+                uint g_h0 = gate_data[header_word];
+                uint g_h1 = gate_data[header_word + 1];
+                uint g_h2 = gate_data[header_word + 2];
+                uint g_h3 = gate_data[header_word + 3];
+
+                uint u_h0 = up_data[header_word];
+                uint u_h1 = up_data[header_word + 1];
+                uint u_h2 = up_data[header_word + 2];
+                uint u_h3 = up_data[header_word + 3];
+
+                float g_d = unpackHalf2x16(g_h0 & 0xFFFFu).x;
+                float g_dmin = unpackHalf2x16((g_h0 >> 16u) & 0xFFFFu).x;
+                float u_d = unpackHalf2x16(u_h0 & 0xFFFFu).x;
+                float u_dmin = unpackHalf2x16((u_h0 >> 16u) & 0xFFFFu).x;
+
+                float g_sc, g_mn, u_sc, u_mn;
+                unpackScaleMin(sub_block_in_sb, g_h1, g_h2, g_h3, g_sc, g_mn);
+                unpackScaleMin(sub_block_in_sb, u_h1, u_h2, u_h3, u_sc, u_mn);
+
+                float g_d_sc = g_d * g_sc;
+                float g_dmin_mn = g_dmin * g_mn;
+                float u_d_sc = u_d * u_sc;
+                float u_dmin_mn = u_dmin * u_mn;
+
+                // Read qh: 32 bits for this sub-block
+                uint qh_byte = panel * panel_stride + header_section_size
+                    + (super_block_idx * PANEL_N + col) * Q5_K_QH_BYTES;
+                uint qh_base_word = qh_byte >> 2;
+                uint g_qh_word = gate_data[qh_base_word + sub_block_in_sb];
+                uint u_qh_word = up_data[qh_base_word + sub_block_in_sb];
+
+                // Data: 32 bytes at group*32 within qs section
+                uint data_byte = panel * panel_stride + header_section_size + qh_section_size
+                    + (super_block_idx * PANEL_N + col) * Q5_K_DATA_BYTES
+                    + group * 32u;
+                uint base_word = data_byte >> 2;
+
+                // 8 uint32 words = 32 bytes = 32 nibble pairs
+                // qh bit for element k within sub-block = bit k of qh_word
+                [[unroll]] for (uint k = 0; k < 8; k++) {
+                    uint gp = gate_data[base_word + k];
+                    uint up_val = up_data[base_word + k];
+                    uint base_k = k * 4;
+                    uint qh_shift = base_k;
+
+                    G_tile[col * B_STRIDE + base_k + 0] = g_d_sc * float(((gp >> nibble_shift) & 0xFu) | (((g_qh_word >> (qh_shift      )) & 1u) << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 1] = g_d_sc * float(((gp >> (8u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 1u)) & 1u) << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 2] = g_d_sc * float(((gp >> (16u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 2u)) & 1u) << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 3] = g_d_sc * float(((gp >> (24u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 3u)) & 1u) << 4u)) - g_dmin_mn;
+
+                    U_tile[col * B_STRIDE + base_k + 0] = u_d_sc * float(((up_val >> nibble_shift) & 0xFu) | (((u_qh_word >> (qh_shift      )) & 1u) << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 1] = u_d_sc * float(((up_val >> (8u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 1u)) & 1u) << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 2] = u_d_sc * float(((up_val >> (16u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 2u)) & 1u) << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 3] = u_d_sc * float(((up_val >> (24u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 3u)) & 1u) << 4u)) - u_dmin_mn;
+                }
+            } else {
+                [[unroll]] for (uint k = 0; k < 32; k++) {
+                    G_tile[col * B_STRIDE + k] = 0.0;
+                    U_tile[col * B_STRIDE + k] = 0.0;
+                }
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k];
+            }
+            [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                uint b_idx = (thread_n * THREAD_N + j) * B_STRIDE + k;
+                float g_val = G_tile[b_idx];
+                float u_val = U_tile[b_idx];
+                [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                    gate_acc[i * THREAD_N + j] += a_vals[i] * g_val;
+                    up_acc[i * THREAD_N + j] += a_vals[i] * u_val;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write: SiLU(gate) * up
+    [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                float gate = gate_acc[i * THREAD_N + j];
+                float silu = gate / (1.0 + exp(-gate));
+                output_data[gm * out_dim + gn] = float16_t(silu * up_acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}
