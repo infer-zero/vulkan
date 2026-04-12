@@ -12,7 +12,8 @@
 //   [headers: num_blocks * PANEL_N * 16B]
 //   [qh: num_blocks * PANEL_N * 32B]
 //   [data: num_blocks * PANEL_N * 128B]
-// qh: 256 bits per block per row, bit j is the 5th bit of element j.
+// qh layout: 4 groups x 8 bytes. Each byte covers 4 positions (l/4),
+//   bit (l%4)*2 = low nibble high-bit, bit (l%4)*2+1 = high nibble high-bit.
 // Dequant: value = d * sub_scale * (nibble | (qh_bit << 4)) - dmin * sub_min
 
 layout(local_size_x = 128) in;
@@ -87,9 +88,9 @@ void main() {
         uint byte_offset_in_qs = group * 32u + (pos_in_group & 31u);
         uint nibble_shift = is_high * 4u;
 
-        // qh bit extraction: elem_in_block is the bit index within the 256-bit qh array.
-        uint qh_word_idx = elem_in_block / 32u;
-        uint qh_bit_offset = elem_in_block % 32u;
+        // qh: group*8 + pos_l/4 gives the byte, bit (pos_l%4)*2+is_high gives the bit
+        uint pos_l = pos_in_group & 31u;  // 0-31 within sub-block
+        uint qh_byte_in_block = group * 8u + pos_l / 4u;  // byte index 0-31 within qh
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
@@ -125,13 +126,39 @@ void main() {
             float u_d_sc = u_d * u_sc;
             float u_dmin_mn = u_dmin * u_mn;
 
-            // Read qh from qh section
-            uint qh_section_base = panel_base_u32 + header_section_u32;
-            uint qh_off = qh_section_base + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_QH_BYTES / 4);
-            uint g_qh_bits = gate_weight_data[qh_off + qh_word_idx] >> qh_bit_offset;
-            uint u_qh_bits = up_weight_data[qh_off + qh_word_idx] >> qh_bit_offset;
+            // qh section: 32 bytes per row per block = 8 uint32 words
+            uint qh_base = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_QH_BYTES / 4);
+            // Read the word containing our qh byte pair
+            uint g_qh_word = gate_weight_data[qh_base + qh_byte_in_block / 4u];
+            uint u_qh_word = up_weight_data[qh_base + qh_byte_in_block / 4u];
+            uint qh_byte_shift = (qh_byte_in_block % 4u) * 8u;
+            // Extract the two consecutive bytes covering our 8 elements
+            uint g_qh_b0 = (g_qh_word >> qh_byte_shift) & 0xFFu;
+            uint g_qh_b1 = (g_qh_word >> (qh_byte_shift + 8u)) & 0xFFu;
+            uint u_qh_b0 = (u_qh_word >> qh_byte_shift) & 0xFFu;
+            uint u_qh_b1 = (u_qh_word >> (qh_byte_shift + 8u)) & 0xFFu;
 
-            // Read nibble data
+            // Extract per-element qh bits: bit (k%4)*2 + is_high from appropriate byte
+            uint is = nibble_shift / 4u;  // 0 for low, 1 for high
+            uint g_qh0 = ((g_qh_b0 >> (0u + is)) & 1u);
+            uint g_qh1 = ((g_qh_b0 >> (2u + is)) & 1u);
+            uint g_qh2 = ((g_qh_b0 >> (4u + is)) & 1u);
+            uint g_qh3 = ((g_qh_b0 >> (6u + is)) & 1u);
+            uint g_qh4 = ((g_qh_b1 >> (0u + is)) & 1u);
+            uint g_qh5 = ((g_qh_b1 >> (2u + is)) & 1u);
+            uint g_qh6 = ((g_qh_b1 >> (4u + is)) & 1u);
+            uint g_qh7 = ((g_qh_b1 >> (6u + is)) & 1u);
+
+            uint u_qh0 = ((u_qh_b0 >> (0u + is)) & 1u);
+            uint u_qh1 = ((u_qh_b0 >> (2u + is)) & 1u);
+            uint u_qh2 = ((u_qh_b0 >> (4u + is)) & 1u);
+            uint u_qh3 = ((u_qh_b0 >> (6u + is)) & 1u);
+            uint u_qh4 = ((u_qh_b1 >> (0u + is)) & 1u);
+            uint u_qh5 = ((u_qh_b1 >> (2u + is)) & 1u);
+            uint u_qh6 = ((u_qh_b1 >> (4u + is)) & 1u);
+            uint u_qh7 = ((u_qh_b1 >> (6u + is)) & 1u);
+
+            // qs section: 128 bytes per row per block = 32 uint32 words
             uint data_section_base = panel_base_u32 + header_section_u32 + qh_section_u32;
             uint data_off = data_section_base + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_DATA_BYTES / 4);
             uint word_off = data_off + byte_offset_in_qs / 4u;
@@ -141,28 +168,28 @@ void main() {
             uint uw0 = up_weight_data[word_off];
             uint uw1 = up_weight_data[word_off + 1];
 
-            // 5-bit dequant with per-element expansion: d_sc * (nibble | (qh_bit << 4)) - dmin_mn
+            // 5-bit dequant: (nibble | (qh << 4)), factored as d_sc * val5 - dmin_mn * input_sum
             float g_dot =
-                b01.x * (g_d_sc * float(((gw0 >> nibble_shift) & 0xFu) | (((g_qh_bits      ) & 1u) << 4u)) - g_dmin_mn) +
-                b01.y * (g_d_sc * float(((gw0 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 1u) & 1u) << 4u)) - g_dmin_mn) +
-                b23.x * (g_d_sc * float(((gw0 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 2u) & 1u) << 4u)) - g_dmin_mn) +
-                b23.y * (g_d_sc * float(((gw0 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 3u) & 1u) << 4u)) - g_dmin_mn) +
-                b45.x * (g_d_sc * float(((gw1 >> nibble_shift) & 0xFu) | (((g_qh_bits >> 4u) & 1u) << 4u)) - g_dmin_mn) +
-                b45.y * (g_d_sc * float(((gw1 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 5u) & 1u) << 4u)) - g_dmin_mn) +
-                b67.x * (g_d_sc * float(((gw1 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 6u) & 1u) << 4u)) - g_dmin_mn) +
-                b67.y * (g_d_sc * float(((gw1 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_bits >> 7u) & 1u) << 4u)) - g_dmin_mn);
+                b01.x * (g_d_sc * float(((gw0 >> nibble_shift) & 0xFu) | (g_qh0 << 4u)) - g_dmin_mn) +
+                b01.y * (g_d_sc * float(((gw0 >> (8u + nibble_shift)) & 0xFu) | (g_qh1 << 4u)) - g_dmin_mn) +
+                b23.x * (g_d_sc * float(((gw0 >> (16u + nibble_shift)) & 0xFu) | (g_qh2 << 4u)) - g_dmin_mn) +
+                b23.y * (g_d_sc * float(((gw0 >> (24u + nibble_shift)) & 0xFu) | (g_qh3 << 4u)) - g_dmin_mn) +
+                b45.x * (g_d_sc * float(((gw1 >> nibble_shift) & 0xFu) | (g_qh4 << 4u)) - g_dmin_mn) +
+                b45.y * (g_d_sc * float(((gw1 >> (8u + nibble_shift)) & 0xFu) | (g_qh5 << 4u)) - g_dmin_mn) +
+                b67.x * (g_d_sc * float(((gw1 >> (16u + nibble_shift)) & 0xFu) | (g_qh6 << 4u)) - g_dmin_mn) +
+                b67.y * (g_d_sc * float(((gw1 >> (24u + nibble_shift)) & 0xFu) | (g_qh7 << 4u)) - g_dmin_mn);
 
             gate_temp[n] += g_dot;
 
             float u_dot =
-                b01.x * (u_d_sc * float(((uw0 >> nibble_shift) & 0xFu) | (((u_qh_bits      ) & 1u) << 4u)) - u_dmin_mn) +
-                b01.y * (u_d_sc * float(((uw0 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 1u) & 1u) << 4u)) - u_dmin_mn) +
-                b23.x * (u_d_sc * float(((uw0 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 2u) & 1u) << 4u)) - u_dmin_mn) +
-                b23.y * (u_d_sc * float(((uw0 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 3u) & 1u) << 4u)) - u_dmin_mn) +
-                b45.x * (u_d_sc * float(((uw1 >> nibble_shift) & 0xFu) | (((u_qh_bits >> 4u) & 1u) << 4u)) - u_dmin_mn) +
-                b45.y * (u_d_sc * float(((uw1 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 5u) & 1u) << 4u)) - u_dmin_mn) +
-                b67.x * (u_d_sc * float(((uw1 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 6u) & 1u) << 4u)) - u_dmin_mn) +
-                b67.y * (u_d_sc * float(((uw1 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_bits >> 7u) & 1u) << 4u)) - u_dmin_mn);
+                b01.x * (u_d_sc * float(((uw0 >> nibble_shift) & 0xFu) | (u_qh0 << 4u)) - u_dmin_mn) +
+                b01.y * (u_d_sc * float(((uw0 >> (8u + nibble_shift)) & 0xFu) | (u_qh1 << 4u)) - u_dmin_mn) +
+                b23.x * (u_d_sc * float(((uw0 >> (16u + nibble_shift)) & 0xFu) | (u_qh2 << 4u)) - u_dmin_mn) +
+                b23.y * (u_d_sc * float(((uw0 >> (24u + nibble_shift)) & 0xFu) | (u_qh3 << 4u)) - u_dmin_mn) +
+                b45.x * (u_d_sc * float(((uw1 >> nibble_shift) & 0xFu) | (u_qh4 << 4u)) - u_dmin_mn) +
+                b45.y * (u_d_sc * float(((uw1 >> (8u + nibble_shift)) & 0xFu) | (u_qh5 << 4u)) - u_dmin_mn) +
+                b67.x * (u_d_sc * float(((uw1 >> (16u + nibble_shift)) & 0xFu) | (u_qh6 << 4u)) - u_dmin_mn) +
+                b67.y * (u_d_sc * float(((uw1 >> (24u + nibble_shift)) & 0xFu) | (u_qh7 << 4u)) - u_dmin_mn);
 
             up_temp[n] += u_dot;
         }

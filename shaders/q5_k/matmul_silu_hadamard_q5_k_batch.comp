@@ -139,12 +139,13 @@ void main() {
                 float u_d_sc = u_d * u_sc;
                 float u_dmin_mn = u_dmin * u_mn;
 
-                // Read qh: 32 bits for this sub-block
+                // Read qh: 32 bytes per row per block. qh[l] (byte l, 0-31) has
+                // bit j for group j low-nibble, bit j+4 for group j high-nibble.
+                // For sub-block element l: extract (qh[l] >> (group + is_high*4)) & 1.
                 uint qh_byte = panel * panel_stride + header_section_size
                     + (super_block_idx * PANEL_N + col) * Q5_K_QH_BYTES;
                 uint qh_base_word = qh_byte >> 2;
-                uint g_qh_word = gate_data[qh_base_word + sub_block_in_sb];
-                uint u_qh_word = up_data[qh_base_word + sub_block_in_sb];
+                uint qh_bit = group + is_high * 4u;
 
                 // Data: 32 bytes at group*32 within qs section
                 uint data_byte = panel * panel_stride + header_section_size + qh_section_size
@@ -152,23 +153,36 @@ void main() {
                     + group * 32u;
                 uint base_word = data_byte >> 2;
 
-                // 8 uint32 words = 32 bytes = 32 nibble pairs
-                // qh bit for element k within sub-block = bit k of qh_word
+                // Dequant 32 elements: for each element l (0-31), extract qh from byte l
+                // and nibble from qs. qh[l] is at byte offset l within the 32-byte qh array.
                 [[unroll]] for (uint k = 0; k < 8; k++) {
                     uint gp = gate_data[base_word + k];
                     uint up_val = up_data[base_word + k];
                     uint base_k = k * 4;
-                    uint qh_shift = base_k;
 
-                    G_tile[col * B_STRIDE + base_k + 0] = g_d_sc * float(((gp >> nibble_shift) & 0xFu) | (((g_qh_word >> (qh_shift      )) & 1u) << 4u)) - g_dmin_mn;
-                    G_tile[col * B_STRIDE + base_k + 1] = g_d_sc * float(((gp >> (8u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 1u)) & 1u) << 4u)) - g_dmin_mn;
-                    G_tile[col * B_STRIDE + base_k + 2] = g_d_sc * float(((gp >> (16u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 2u)) & 1u) << 4u)) - g_dmin_mn;
-                    G_tile[col * B_STRIDE + base_k + 3] = g_d_sc * float(((gp >> (24u + nibble_shift)) & 0xFu) | (((g_qh_word >> (qh_shift + 3u)) & 1u) << 4u)) - g_dmin_mn;
+                    // Load the uint32 word containing qh bytes [base_k..base_k+3]
+                    uint g_qh_word = gate_data[qh_base_word + base_k / 4u];
+                    uint u_qh_word = up_data[qh_base_word + base_k / 4u];
 
-                    U_tile[col * B_STRIDE + base_k + 0] = u_d_sc * float(((up_val >> nibble_shift) & 0xFu) | (((u_qh_word >> (qh_shift      )) & 1u) << 4u)) - u_dmin_mn;
-                    U_tile[col * B_STRIDE + base_k + 1] = u_d_sc * float(((up_val >> (8u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 1u)) & 1u) << 4u)) - u_dmin_mn;
-                    U_tile[col * B_STRIDE + base_k + 2] = u_d_sc * float(((up_val >> (16u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 2u)) & 1u) << 4u)) - u_dmin_mn;
-                    U_tile[col * B_STRIDE + base_k + 3] = u_d_sc * float(((up_val >> (24u + nibble_shift)) & 0xFu) | (((u_qh_word >> (qh_shift + 3u)) & 1u) << 4u)) - u_dmin_mn;
+                    uint g_qh0 = (g_qh_word >> ((base_k % 4u) * 8u + qh_bit)) & 1u;
+                    uint g_qh1 = (g_qh_word >> (((base_k + 1u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint g_qh2 = (g_qh_word >> (((base_k + 2u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint g_qh3 = (g_qh_word >> (((base_k + 3u) % 4u) * 8u + qh_bit)) & 1u;
+
+                    uint u_qh0 = (u_qh_word >> ((base_k % 4u) * 8u + qh_bit)) & 1u;
+                    uint u_qh1 = (u_qh_word >> (((base_k + 1u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint u_qh2 = (u_qh_word >> (((base_k + 2u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint u_qh3 = (u_qh_word >> (((base_k + 3u) % 4u) * 8u + qh_bit)) & 1u;
+
+                    G_tile[col * B_STRIDE + base_k + 0] = g_d_sc * float(((gp >> nibble_shift) & 0xFu) | (g_qh0 << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 1] = g_d_sc * float(((gp >> (8u + nibble_shift)) & 0xFu) | (g_qh1 << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 2] = g_d_sc * float(((gp >> (16u + nibble_shift)) & 0xFu) | (g_qh2 << 4u)) - g_dmin_mn;
+                    G_tile[col * B_STRIDE + base_k + 3] = g_d_sc * float(((gp >> (24u + nibble_shift)) & 0xFu) | (g_qh3 << 4u)) - g_dmin_mn;
+
+                    U_tile[col * B_STRIDE + base_k + 0] = u_d_sc * float(((up_val >> nibble_shift) & 0xFu) | (u_qh0 << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 1] = u_d_sc * float(((up_val >> (8u + nibble_shift)) & 0xFu) | (u_qh1 << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 2] = u_d_sc * float(((up_val >> (16u + nibble_shift)) & 0xFu) | (u_qh2 << 4u)) - u_dmin_mn;
+                    U_tile[col * B_STRIDE + base_k + 3] = u_d_sc * float(((up_val >> (24u + nibble_shift)) & 0xFu) | (u_qh3 << 4u)) - u_dmin_mn;
                 }
             } else {
                 [[unroll]] for (uint k = 0; k < 32; k++) {

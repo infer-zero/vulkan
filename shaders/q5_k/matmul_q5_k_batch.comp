@@ -126,46 +126,38 @@ void main() {
                 float d_sc = d * sc;
                 float dmin_mn = dmin * mn;
 
-                // Read qh: 32 bits for this sub-block (elements sub_block*32..sub_block*32+31)
-                // The qh section has 32 bytes (8 uint32 words) per row per super-block.
-                // Sub-block s covers elements s*32..s*32+31, which is qh word at index s.
+                // Read qh: 32 bytes per row per block. qh[l] (byte l, 0-31) has
+                // bit j for group j low-nibble, bit j+4 for group j high-nibble.
+                // For sub-block element l: extract (qh[l] >> (group + is_high*4)) & 1.
                 uint qh_byte = panel * panel_stride + header_section_size
                     + (super_block_idx * PANEL_N + col) * Q5_K_QH_BYTES;
                 uint qh_base_word = qh_byte >> 2;
-                uint qh_word = weight_data[qh_base_word + sub_block_in_sb];
+                uint qh_bit = group + is_high * 4u;
 
-                // Data: 16 bytes at group*32 within qs section
+                // Data: 32 bytes at group*32 within qs section
                 uint data_byte = panel * panel_stride + header_section_size + qh_section_size
                     + (super_block_idx * PANEL_N + col) * Q5_K_DATA_BYTES
                     + group * 32u;
                 uint base_word = data_byte >> 2;
 
-                // For low sub-block (is_high=0): elements 0-31 within group, qh bits 0-31
-                // For high sub-block (is_high=1): elements 32-63 within group, qh bits shifted
-                // The qh_word already contains exactly the 32 bits for this sub-block.
-                // Bit 0 of qh_word = element sub_block*32, bit 31 = element sub_block*32+31.
-                // Within the 32-element sub-block: low nibble uses bytes 0-15, high uses bytes 16-31.
-                // is_high=0: elements 0-15 of sub-block -> nibble_shift=0, qh bits 0-15
-                // is_high=1: elements 16-31 of sub-block -> nibble_shift=4, qh bits 16-31
-                // But wait: sub_block = group*2 + is_high, and qh_word covers all 32 elems of that sub-block.
-                // Actually each sub-block is 32 consecutive elements. is_high determines which NIBBLE HALF
-                // of the 64-element group we read. The qh bits for the 32 elements in this sub-block
-                // are exactly the 32 bits of qh_word.
-                // For the low nibble path (is_high=0): element i in sub-block -> qh bit i, low nibble of byte i
-                // For the high nibble path (is_high=1): element i in sub-block -> qh bit i, high nibble of byte i
-
-                // 8 uint32 words = 32 bytes = 32 nibble pairs
-                // is_high=0: extract low nibbles (bits 0-3), is_high=1: extract high nibbles (bits 4-7)
-                // qh bit for element k within sub-block = bit k of qh_word
+                // Dequant 32 elements: for each element l (0-31), extract qh from byte l
+                // and nibble from qs. qh[l] is at byte offset l within the 32-byte qh array.
                 [[unroll]] for (uint k = 0; k < 8; k++) {
                     uint packed = weight_data[base_word + k];
                     uint base_k = k * 4;
-                    uint qh_shift = base_k;
 
-                    B_tile[col * B_STRIDE + base_k + 0] = d_sc * float(((packed >> nibble_shift) & 0xFu) | (((qh_word >> (qh_shift      )) & 1u) << 4u)) - dmin_mn;
-                    B_tile[col * B_STRIDE + base_k + 1] = d_sc * float(((packed >> (8u + nibble_shift)) & 0xFu) | (((qh_word >> (qh_shift + 1u)) & 1u) << 4u)) - dmin_mn;
-                    B_tile[col * B_STRIDE + base_k + 2] = d_sc * float(((packed >> (16u + nibble_shift)) & 0xFu) | (((qh_word >> (qh_shift + 2u)) & 1u) << 4u)) - dmin_mn;
-                    B_tile[col * B_STRIDE + base_k + 3] = d_sc * float(((packed >> (24u + nibble_shift)) & 0xFu) | (((qh_word >> (qh_shift + 3u)) & 1u) << 4u)) - dmin_mn;
+                    // Load the uint32 word containing qh bytes [base_k..base_k+3]
+                    uint qh_word = weight_data[qh_base_word + base_k / 4u];
+
+                    uint qh0 = (qh_word >> ((base_k % 4u) * 8u + qh_bit)) & 1u;
+                    uint qh1 = (qh_word >> (((base_k + 1u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint qh2 = (qh_word >> (((base_k + 2u) % 4u) * 8u + qh_bit)) & 1u;
+                    uint qh3 = (qh_word >> (((base_k + 3u) % 4u) * 8u + qh_bit)) & 1u;
+
+                    B_tile[col * B_STRIDE + base_k + 0] = d_sc * float(((packed >> nibble_shift) & 0xFu) | (qh0 << 4u)) - dmin_mn;
+                    B_tile[col * B_STRIDE + base_k + 1] = d_sc * float(((packed >> (8u + nibble_shift)) & 0xFu) | (qh1 << 4u)) - dmin_mn;
+                    B_tile[col * B_STRIDE + base_k + 2] = d_sc * float(((packed >> (16u + nibble_shift)) & 0xFu) | (qh2 << 4u)) - dmin_mn;
+                    B_tile[col * B_STRIDE + base_k + 3] = d_sc * float(((packed >> (24u + nibble_shift)) & 0xFu) | (qh3 << 4u)) - dmin_mn;
                 }
             } else {
                 [[unroll]] for (uint k = 0; k < 32; k++) {
