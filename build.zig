@@ -16,6 +16,7 @@ pub const ShaderGroups = struct {
     shared: bool = false,
     bf16: bool = false,
     q8_0: bool = false,
+    q5_0: bool = false,
     q4_0: bool = false,
     q4_k: bool = false,
     q6_k: bool = false,
@@ -98,6 +99,15 @@ const q8_0_shaders = [_]Shader{
     variant("shaders/q8_0", "matmul_silu_hadamard_q8_0_batch", "matmul_silu_hadamard_q8_0_batch_idp", .vulkan1_3, &.{"-DIDP_MODE"}),
 };
 
+const q5_0_shaders = [_]Shader{
+    shader("shaders/q5_0", "matmul_q5_0_panel_matvec"),
+    shader("shaders/q5_0", "matmul_silu_hadamard_q5_0_panel_matvec"),
+    shader("shaders/q5_0", "matmul_q5_0_batch"),
+    shader("shaders/q5_0", "matmul_silu_hadamard_q5_0_batch"),
+    // Variants
+    variant("shaders/q5_0", "matmul_q5_0_panel_matvec", "matmul_q5_0_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
+};
+
 const q4_0_shaders = [_]Shader{
     shader("shaders/q4_0", "f16_to_bf16"),
     shader("shaders/q4_0", "matmul_q4_0_logits"),
@@ -164,6 +174,7 @@ pub fn addShaders(
         .{ .enabled = groups.shared, .shaders = &shared_shaders },
         .{ .enabled = groups.bf16, .shaders = &bf16_shaders },
         .{ .enabled = groups.q8_0, .shaders = &q8_0_shaders },
+        .{ .enabled = groups.q5_0, .shaders = &q5_0_shaders },
         .{ .enabled = groups.q4_0, .shaders = &q4_0_shaders },
         .{ .enabled = groups.q4_k, .shaders = &q4_k_shaders },
         .{ .enabled = groups.q6_k, .shaders = &q6_k_shaders },
@@ -256,6 +267,7 @@ pub fn build(b: *std.Build) void {
         &shared_shaders,
         &bf16_shaders,
         &q8_0_shaders,
+        &q5_0_shaders,
         &q4_0_shaders,
         &q4_k_shaders,
         &q6_k_shaders,

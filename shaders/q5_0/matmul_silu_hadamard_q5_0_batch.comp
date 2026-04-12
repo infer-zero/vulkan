@@ -1,0 +1,169 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : require
+
+// Tiled GEMM with fused SiLU and Hadamard product for Q5_0 weights:
+// gate[M,N] = A[M,K] x Gate^T[N,K]
+// up[M,N]   = A[M,K] x Up^T[N,K]
+// output[M,N] = SiLU(gate[M,N]) * up[M,N]
+//
+// Weight buffer layout (panel-interleaved, PANEL_N=128):
+//   Per panel: [f16 scales: num_blocks * PANEL_N * 2B]
+//              [uint32 qh masks: num_blocks * PANEL_N * 4B]
+//              [nibble data: num_blocks * PANEL_N * 16B]
+// Q5_0 block: 32 values in 22 bytes (2B f16 scale + 4B uint32 qh + 16B packed nibbles).
+// Dequant: value = scale * float(int(nibble | (high_bit << 4)) - 16)
+
+#define TILE_M 64
+#define TILE_N 128
+#define TILE_K 32
+#define WG_M 8
+#define WG_N 32
+#define THREAD_M 8
+#define THREAD_N 4
+#define PANEL_N 128
+#define Q5_0_BLOCK_SIZE 22
+#define Q5_0_SCALE_BYTES 2
+#define Q5_0_QH_BYTES 4
+#define Q5_0_DATA_BYTES 16
+
+#define A_STRIDE 33
+#define B_STRIDE 33
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
+layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint batch_size;
+};
+
+shared float A_tile[TILE_M * A_STRIDE];
+shared float G_tile[TILE_N * B_STRIDE];
+shared float U_tile[TILE_N * B_STRIDE];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_n = gl_WorkGroupID.x;
+    uint wg_m = gl_WorkGroupID.y;
+
+    uint thread_m = tid / WG_N;
+    uint thread_n = tid % WG_N;
+
+    uint m_base = wg_m * TILE_M;
+    uint n_base = wg_n * TILE_N;
+
+    uint num_blocks = in_dim / 32;
+    uint panel = n_base / PANEL_N;
+    uint panel_stride = num_blocks * PANEL_N * Q5_0_BLOCK_SIZE;
+    uint scale_section_size = num_blocks * PANEL_N * Q5_0_SCALE_BYTES;
+    uint qh_section_size = num_blocks * PANEL_N * Q5_0_QH_BYTES;
+
+    float gate_acc[THREAD_M * THREAD_N];
+    float up_acc[THREAD_M * THREAD_N];
+    [[unroll]] for (uint i = 0; i < THREAD_M * THREAD_N; i++) {
+        gate_acc[i] = 0.0;
+        up_acc[i] = 0.0;
+    }
+
+    for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
+        uint k_base = block_idx * 32;
+
+        // Load A tile
+        [[unroll]] for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
+            uint m = i / TILE_K;
+            uint k = i % TILE_K;
+            uint gm = m_base + m;
+            A_tile[m * A_STRIDE + k] = (gm < batch_size)
+                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+        }
+
+        // Load Gate and Up tiles: Q5_0 dequant (4 uint32 words + qh = 32 5-bit values)
+        if (tid < TILE_N) {
+            uint col = tid;
+            uint gn = n_base + col;
+            if (gn < out_dim) {
+                uint scale_byte = panel * panel_stride + block_idx * PANEL_N * Q5_0_SCALE_BYTES + col * 2;
+                uint qh_byte = panel * panel_stride + scale_section_size + block_idx * PANEL_N * Q5_0_QH_BYTES + col * 4;
+                uint data_byte = panel * panel_stride + scale_section_size + qh_section_size + block_idx * PANEL_N * Q5_0_DATA_BYTES + col * 16;
+
+                uint g_scale_word = gate_data[scale_byte >> 2];
+                uint u_scale_word = up_data[scale_byte >> 2];
+                float g_scale = unpackHalf2x16((g_scale_word >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+                float u_scale = unpackHalf2x16((u_scale_word >> ((scale_byte & 2u) * 8u)) & 0xFFFFu).x;
+
+                uint g_qh = gate_data[qh_byte >> 2];
+                uint u_qh = up_data[qh_byte >> 2];
+
+                uint base_word = data_byte >> 2;
+                [[unroll]] for (uint k = 0; k < 4; k++) {
+                    uint gp = gate_data[base_word + k];
+                    uint up_val = up_data[base_word + k];
+                    uint base_k = k * 4;
+                    // Low nibbles: elements k*4 .. k*4+3
+                    G_tile[col * B_STRIDE + base_k + 0] = g_scale * float(int((gp & 0xFu) | (((g_qh >> (base_k     )) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 1] = g_scale * float(int(((gp >> 8u) & 0xFu) | (((g_qh >> (base_k + 1u)) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 2] = g_scale * float(int(((gp >> 16u) & 0xFu) | (((g_qh >> (base_k + 2u)) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 3] = g_scale * float(int(((gp >> 24u) & 0xFu) | (((g_qh >> (base_k + 3u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 0] = u_scale * float(int((up_val & 0xFu) | (((u_qh >> (base_k     )) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 1] = u_scale * float(int(((up_val >> 8u) & 0xFu) | (((u_qh >> (base_k + 1u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 2] = u_scale * float(int(((up_val >> 16u) & 0xFu) | (((u_qh >> (base_k + 2u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 3] = u_scale * float(int(((up_val >> 24u) & 0xFu) | (((u_qh >> (base_k + 3u)) & 1u) << 4u)) - 16);
+                    // High nibbles: elements k*4+16 .. k*4+19
+                    G_tile[col * B_STRIDE + base_k + 16] = g_scale * float(int(((gp >> 4u) & 0xFu) | (((g_qh >> (base_k + 16u)) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 17] = g_scale * float(int(((gp >> 12u) & 0xFu) | (((g_qh >> (base_k + 17u)) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 18] = g_scale * float(int(((gp >> 20u) & 0xFu) | (((g_qh >> (base_k + 18u)) & 1u) << 4u)) - 16);
+                    G_tile[col * B_STRIDE + base_k + 19] = g_scale * float(int(((gp >> 28u) & 0xFu) | (((g_qh >> (base_k + 19u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 16] = u_scale * float(int(((up_val >> 4u) & 0xFu) | (((u_qh >> (base_k + 16u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 17] = u_scale * float(int(((up_val >> 12u) & 0xFu) | (((u_qh >> (base_k + 17u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 18] = u_scale * float(int(((up_val >> 20u) & 0xFu) | (((u_qh >> (base_k + 18u)) & 1u) << 4u)) - 16);
+                    U_tile[col * B_STRIDE + base_k + 19] = u_scale * float(int(((up_val >> 28u) & 0xFu) | (((u_qh >> (base_k + 19u)) & 1u) << 4u)) - 16);
+                }
+            } else {
+                [[unroll]] for (uint k = 0; k < 32; k++) {
+                    G_tile[col * B_STRIDE + k] = 0.0;
+                    U_tile[col * B_STRIDE + k] = 0.0;
+                }
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint k = 0; k < TILE_K; k++) {
+            float a_vals[THREAD_M];
+            [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                a_vals[i] = A_tile[(thread_m * THREAD_M + i) * A_STRIDE + k];
+            }
+            [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+                uint b_idx = (thread_n * THREAD_N + j) * B_STRIDE + k;
+                float g_val = G_tile[b_idx];
+                float u_val = U_tile[b_idx];
+                [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+                    gate_acc[i * THREAD_N + j] += a_vals[i] * g_val;
+                    up_acc[i * THREAD_N + j] += a_vals[i] * u_val;
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write: SiLU(gate) * up
+    [[unroll]] for (uint i = 0; i < THREAD_M; i++) {
+        uint gm = m_base + thread_m * THREAD_M + i;
+        if (gm >= batch_size) continue;
+        [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
+            uint gn = n_base + thread_n * THREAD_N + j;
+            if (gn < out_dim) {
+                float gate = gate_acc[i * THREAD_N + j];
+                float silu = gate / (1.0 + exp(-gate));
+                output_data[gm * out_dim + gn] = float16_t(silu * up_acc[i * THREAD_N + j]);
+            }
+        }
+    }
+}
