@@ -8,6 +8,9 @@ layout(set = 0, binding = 1) buffer readonly B { float16_t data_b[]; };
 
 layout(push_constant) uniform Params {
     uint count;
+#ifdef RESIDUAL_SCALE
+    float residual_scale;
+#endif
 };
 
 void main() {
@@ -19,5 +22,9 @@ void main() {
 #else
     uint offset = idx;
 #endif
+#ifdef RESIDUAL_SCALE
+    data_a[offset] = float16_t(float(data_a[offset]) * residual_scale + float(data_b[offset]));
+#else
     data_a[offset] = float16_t(float(data_a[offset]) + float(data_b[offset]));
+#endif
 }
