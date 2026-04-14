@@ -23,10 +23,10 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -74,13 +74,13 @@ void main() {
     for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
         uint k_base = block_idx * 32;
 
-        // Load A tile: TILE_M x TILE_K = 64 x 32 = 2048 elements
+        // Load A tile: f32 global -> f16 shared (coop matrix expects f16)
         for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
             uint m = i / TILE_K;
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? input_data[gm * in_dim + k_base + k] : float16_t(0.0);
+                ? float16_t(input_data[gm * in_dim + k_base + k]) : float16_t(0.0);
         }
 
         // Load Gate and Up tiles: 128 threads each dequantize one Q8_0 block
@@ -175,7 +175,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
         }
     }
 
@@ -192,7 +192,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
         }
     }
 
@@ -209,7 +209,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
         }
     }
 
@@ -226,7 +226,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
+            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
         }
     }
 }

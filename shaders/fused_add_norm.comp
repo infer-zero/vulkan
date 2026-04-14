@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_ARB_gpu_shader_fp64 : enable
 
 // Fused: add_vectors + cmdCopy(state->residual) + rms_norm
@@ -11,8 +10,8 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer State { float16_t state[]; };
-layout(set = 0, binding = 1) buffer Residual { float16_t residual[]; };
+layout(set = 0, binding = 0) buffer State { float state[]; };
+layout(set = 0, binding = 1) buffer Residual { float residual[]; };
 layout(set = 0, binding = 2) buffer readonly Weights { float weights[]; };
 
 layout(push_constant) uniform Params {
@@ -37,19 +36,16 @@ void main() {
     // Phase 1: optionally add residual, save to residual, compute sum of squares
     double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
-        float s = float(state[i]);
+        float s = state[i];
         if (apply_add != 0) {
 #ifdef RESIDUAL_SCALE
-            s = s * residual_scale + float(residual[i]);
+            s = s * residual_scale + residual[i];
 #else
-            s += float(residual[i]);
+            s += residual[i];
 #endif
         }
-        // Save combined value as new residual, and use the f16-rounded value
-        // for sum-of-squares so inv_rms matches the values actually used in
-        // phase 2 (which reads `residual` after the f16 round-trip).
-        residual[i] = float16_t(s);
-        double s_r = double(float(residual[i]));
+        residual[i] = s;
+        double s_r = double(s);
         partial += s_r * s_r;
     }
     shared_sum[tid] = partial;
@@ -67,6 +63,6 @@ void main() {
 
     // Phase 2: normalize and scale (read from residual which has the summed value)
     for (uint i = tid; i < dim; i += wg_size) {
-        state[i] = float16_t(float(residual[i]) * inv_rms * weights[i]);
+        state[i] = residual[i] * inv_rms * weights[i];
     }
 }

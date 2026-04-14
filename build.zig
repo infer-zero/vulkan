@@ -79,6 +79,7 @@ const bf16_shaders = [_]Shader{
 
 const q8_0_shaders = [_]Shader{
     shader("shaders/q8_0", "f16_to_bf16"),
+    shader("shaders/q8_0", "f32_to_bf16"),
     shader("shaders/q8_0", "matmul_q8_0_logits"),
     shader("shaders/q8_0", "matmul_silu_hadamard_q8_0"),
     shader("shaders/q8_0", "matmul_q8_0_panel_matvec"),
@@ -95,6 +96,7 @@ const q8_0_shaders = [_]Shader{
     shaderVk13("shaders/q8_0", "matmul_q8_0_batch_coop_int8_ksplit"),
     // Variants
     variant("shaders/q8_0", "f16_to_bf16", "f16_to_bf16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
+    variant("shaders/q8_0", "f32_to_bf16", "f32_to_bf16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders/q8_0", "matmul_q8_0_panel_matvec", "matmul_q8_0_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
     variant("shaders/q8_0", "matmul_q8_0_batch", "matmul_q8_0_batch_idp", .vulkan1_3, &.{"-DIDP_MODE"}),
     variant("shaders/q8_0", "matmul_silu_hadamard_q8_0_batch", "matmul_silu_hadamard_q8_0_batch_idp", .vulkan1_3, &.{"-DIDP_MODE"}),

@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Copy token embedding into the state buffer.
 // Supports f32 and packed BF16 embedding formats (via BF16_EMBEDDINGS).
@@ -12,7 +11,7 @@ layout(set = 0, binding = 0) buffer readonly EmbTable { uint emb_packed[]; };
 #else
 layout(set = 0, binding = 0) buffer readonly EmbTable { float emb_table[]; };
 #endif
-layout(set = 0, binding = 1) buffer State { float16_t state[]; };
+layout(set = 0, binding = 1) buffer State { float state[]; };
 
 #ifdef BATCH_MODE
 layout(set = 0, binding = 2) buffer readonly TokenIds { uint token_ids[]; };
@@ -52,12 +51,12 @@ void main() {
     uint word_idx = emb_idx >> 1u;
     uint lane = emb_idx & 1u;
     float val = bf16ToFloat(emb_packed[word_idx], lane) * embedding_multiplier;
-    state[dst] = float16_t(val);
+    state[dst] = val;
 #else
     float val = emb_table[token_id * dim + idx];
     #ifdef WITH_EMBEDDING_MULTIPLIER
         val *= embedding_multiplier;
     #endif
-    state[dst] = float16_t(val);
+    state[dst] = val;
 #endif
 }

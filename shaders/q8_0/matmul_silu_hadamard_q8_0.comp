@@ -1,15 +1,14 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Coalesced fused gate+up+SiLU matvec with K-splitting.
 // 512 threads: 128 panel rows x 4 K-splits.
 
 layout(local_size_x = 512) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -44,7 +43,7 @@ void main() {
     for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
         if (tid < TILE_K) {
             uint load_idx = tile_start + tid;
-            input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+            input_tile[tid] = (load_idx < in_dim) ? input_data[load_idx] : 0.0;
         }
         barrier();
 
@@ -97,6 +96,6 @@ void main() {
         float g = partial_gate[tid] + partial_gate[tid + 128] + partial_gate[tid + 256] + partial_gate[tid + 384];
         float u = partial_up[tid] + partial_up[tid + 128] + partial_up[tid + 256] + partial_up[tid + 384];
         float silu = g / (1.0 + exp(-g));
-        output_data[global_row] = float16_t(silu * u);
+        output_data[global_row] = silu * u;
     }
 }
