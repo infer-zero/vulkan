@@ -26,7 +26,8 @@
 #define SG_TILE_N 32
 
 #define PANEL_N 128
-#define Q8_BLOCK_SIZE 34
+#define Q8_BLOCK_SIZE 34    // B (weights): 2-byte f16 scale + 32 bytes data
+#define A_BLOCK_SIZE  36    // A (activations from quantize_to_q8): 4-byte f32 scale + 32 bytes data
 
 #define mat_a_i8  coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA>
 #define mat_b_i8  coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB>
@@ -80,7 +81,7 @@ void main() {
     uint panel_stride = num_blocks * PANEL_N * Q8_BLOCK_SIZE;
     uint scale_section_size = num_blocks * PANEL_N * 2;
 
-    uint input_row_stride = num_blocks * Q8_BLOCK_SIZE;  // bytes per activation row
+    uint input_row_stride = num_blocks * A_BLOCK_SIZE;  // bytes per activation row (36B block: 4B f32 scale + 32B data)
 
     // K-range for this k_group
     uint blocks_per_group = (num_blocks + num_k_groups - 1) / num_k_groups;
@@ -123,10 +124,13 @@ void main() {
         if (tid < TILE_M) {
             uint gm = m_base + tid;
             if (gm < batch_size) {
-                uint sb_a = gm * input_row_stride + block_idx * Q8_BLOCK_SIZE;
-                uint lo_a = uint(input_data[sb_a]) & 0xFFu;
-                uint hi_a = uint(input_data[sb_a + 1]) & 0xFFu;
-                A_scales[tid] = unpackHalf2x16(lo_a | (hi_a << 8u)).x;
+                uint sb_a = gm * input_row_stride + block_idx * A_BLOCK_SIZE;
+                // Scale is stored as float32 (4 bytes) by quantize_to_q8
+                uint b0 = uint(input_data[sb_a + 0]) & 0xFFu;
+                uint b1 = uint(input_data[sb_a + 1]) & 0xFFu;
+                uint b2 = uint(input_data[sb_a + 2]) & 0xFFu;
+                uint b3 = uint(input_data[sb_a + 3]) & 0xFFu;
+                A_scales[tid] = uintBitsToFloat(b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u));
             } else {
                 A_scales[tid] = 0.0;
             }
@@ -168,7 +172,7 @@ void main() {
         uint a_row0 = m_base + sg_m_base;
 
         // M-row 0
-        coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)
             acc00[e] += float(s32_result[e]) * a_sc[0][e] * b_sc[0][e];
@@ -177,7 +181,7 @@ void main() {
             acc01[e] += float(s32_result[e]) * a_sc[0][e] * b_sc[1][e];
 
         // M-row 1
-        coopMatLoad(a_i8, input_data, (a_row0 + 16) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a_i8, input_data, (a_row0 + 16) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)
             acc10[e] += float(s32_result[e]) * a_sc[1][e] * b_sc[0][e];
@@ -186,7 +190,7 @@ void main() {
             acc11[e] += float(s32_result[e]) * a_sc[1][e] * b_sc[1][e];
 
         // M-row 2
-        coopMatLoad(a_i8, input_data, (a_row0 + 32) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a_i8, input_data, (a_row0 + 32) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)
             acc20[e] += float(s32_result[e]) * a_sc[2][e] * b_sc[0][e];
@@ -195,7 +199,7 @@ void main() {
             acc21[e] += float(s32_result[e]) * a_sc[2][e] * b_sc[1][e];
 
         // M-row 3
-        coopMatLoad(a_i8, input_data, (a_row0 + 48) * input_row_stride + block_idx * Q8_BLOCK_SIZE + 2, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a_i8, input_data, (a_row0 + 48) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)
             acc30[e] += float(s32_result[e]) * a_sc[3][e] * b_sc[0][e];

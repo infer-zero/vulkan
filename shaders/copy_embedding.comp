@@ -22,7 +22,7 @@ layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; 
 
 layout(push_constant) uniform Params {
     uint dim;
-#ifdef BF16_EMBEDDINGS
+#if defined(BF16_EMBEDDINGS) || defined(WITH_EMBEDDING_MULTIPLIER)
     float embedding_multiplier;
 #endif
 };
@@ -54,6 +54,10 @@ void main() {
     float val = bf16ToFloat(emb_packed[word_idx], lane) * embedding_multiplier;
     state[dst] = float16_t(val);
 #else
-    state[dst] = float16_t(emb_table[token_id * dim + idx]);
+    float val = emb_table[token_id * dim + idx];
+    #ifdef WITH_EMBEDDING_MULTIPLIER
+        val *= embedding_multiplier;
+    #endif
+    state[dst] = float16_t(val);
 #endif
 }

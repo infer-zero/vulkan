@@ -407,9 +407,22 @@ pub const VulkanDevice = struct {
             .compute_full_subgroups = vk.FALSE,
         };
 
+        // Enable shaderFloat64 for the f64 sum-of-squares / softmax accumulators
+        // in rmsNorm and softmax shaders (matches llama.cpp's `ggml_float`).
+        // Without explicitly enabling this device feature, drivers may fall back
+        // to a slow software-emulation path that uses much more device memory.
+        var device_features2 = vk.PhysicalDeviceFeatures2{
+            .p_next = @ptrCast(&subgroup_size_ctrl_features),
+            .features = blk: {
+                var f = std.mem.zeroes(vk.PhysicalDeviceFeatures);
+                f.shader_float_64 = vk.TRUE;
+                break :blk f;
+            },
+        };
+
         const queue_priority = [_]f32{1.0};
         const device = vki.createDevice(selected_device, &.{
-            .p_next = if (has_subgroup_size_control) @ptrCast(&subgroup_size_ctrl_features) else @ptrCast(&storage_16bit_features),
+            .p_next = @ptrCast(&device_features2),
             .queue_create_info_count = 1,
             .p_queue_create_infos = &[_]vk.DeviceQueueCreateInfo{.{
                 .queue_family_index = queue_family_index,

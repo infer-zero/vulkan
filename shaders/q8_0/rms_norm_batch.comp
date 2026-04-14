@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_ARB_gpu_shader_fp64 : enable
 
 layout(local_size_x = 256) in;
 
@@ -11,7 +12,8 @@ layout(push_constant) uniform Params {
     float epsilon;
 };
 
-shared float shared_sum[256];
+// f64 sum-of-squares to match llama.cpp's ggml_float.
+shared double shared_sum[256];
 
 void main() {
     uint batch_idx = gl_WorkGroupID.x;
@@ -20,9 +22,9 @@ void main() {
     uint base = batch_idx * dim;
 
     // Phase 1: compute partial sum of squares
-    float partial = 0.0;
+    double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
-        float v = float(state[base + i]);
+        double v = double(float(state[base + i]));
         partial += v * v;
     }
     shared_sum[tid] = partial;
@@ -36,7 +38,7 @@ void main() {
         barrier();
     }
 
-    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
 
     // Phase 2: scale
     for (uint i = tid; i < dim; i += wg_size) {

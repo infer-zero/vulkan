@@ -12,8 +12,8 @@
 //   [headers: num_blocks * PANEL_N * 16B]
 //   [qh: num_blocks * PANEL_N * 32B]
 //   [data: num_blocks * PANEL_N * 128B]
-// qh layout: 4 groups x 8 bytes. Each byte covers 4 positions (l/4),
-//   bit (l%4)*2 = low nibble high-bit, bit (l%4)*2+1 = high nibble high-bit.
+// qh layout (GGML): 32 bytes. qh[l] (byte l, 0-31) contains all groups' bits
+//   for position l: bit j = group j low nibble high-bit, bit (j+4) = group j high nibble high-bit.
 // Dequant: value = d * sub_scale * (nibble | (qh_bit << 4)) - dmin * sub_min
 
 layout(local_size_x = 128) in;
@@ -84,13 +84,14 @@ void main() {
         uint group = elem_in_block / 64u;
         uint pos_in_group = elem_in_block % 64u;
         uint is_high = (pos_in_group >= 32u) ? 1u : 0u;
-        uint sub_block = group * 2u + is_high;
+        uint sub_block = group + is_high * 4u;  // Q5_K: j for low, j+4 for high
         uint byte_offset_in_qs = group * 32u + (pos_in_group & 31u);
         uint nibble_shift = is_high * 4u;
 
-        // qh: group*8 + pos_l/4 gives the byte, bit (pos_l%4)*2+is_high gives the bit
+        // qh: GGML layout - qh[l] contains all groups' bits for position l
+        // bit group = low nibble high-bit, bit (group+4) = high nibble high-bit
         uint pos_l = pos_in_group & 31u;  // 0-31 within sub-block
-        uint qh_byte_in_block = group * 8u + pos_l / 4u;  // byte index 0-31 within qh
+        uint qh_bit = group + (nibble_shift / 4u) * 4u;  // group for low, group+4 for high
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
@@ -128,35 +129,30 @@ void main() {
 
             // qh section: 32 bytes per row per block = 8 uint32 words
             uint qh_base = panel_base_u32 + header_section_u32 + (super_block_idx * PANEL_N + col_in_panel) * (Q5_K_QH_BYTES / 4);
-            // Read the word containing our qh byte pair
-            uint g_qh_word = gate_weight_data[qh_base + qh_byte_in_block / 4u];
-            uint u_qh_word = up_weight_data[qh_base + qh_byte_in_block / 4u];
-            uint qh_byte_shift = (qh_byte_in_block % 4u) * 8u;
-            // Extract the two consecutive bytes covering our 8 elements
-            uint g_qh_b0 = (g_qh_word >> qh_byte_shift) & 0xFFu;
-            uint g_qh_b1 = (g_qh_word >> (qh_byte_shift + 8u)) & 0xFFu;
-            uint u_qh_b0 = (u_qh_word >> qh_byte_shift) & 0xFFu;
-            uint u_qh_b1 = (u_qh_word >> (qh_byte_shift + 8u)) & 0xFFu;
+            // Read 2 consecutive uint32 words covering qh bytes [pos_l..pos_l+7]
+            uint g_qh_word0 = gate_weight_data[qh_base + pos_l / 4u];
+            uint g_qh_word1 = gate_weight_data[qh_base + pos_l / 4u + 1u];
+            uint u_qh_word0 = up_weight_data[qh_base + pos_l / 4u];
+            uint u_qh_word1 = up_weight_data[qh_base + pos_l / 4u + 1u];
 
-            // Extract per-element qh bits: bit (k%4)*2 + is_high from appropriate byte
-            uint is = nibble_shift / 4u;  // 0 for low, 1 for high
-            uint g_qh0 = ((g_qh_b0 >> (0u + is)) & 1u);
-            uint g_qh1 = ((g_qh_b0 >> (2u + is)) & 1u);
-            uint g_qh2 = ((g_qh_b0 >> (4u + is)) & 1u);
-            uint g_qh3 = ((g_qh_b0 >> (6u + is)) & 1u);
-            uint g_qh4 = ((g_qh_b1 >> (0u + is)) & 1u);
-            uint g_qh5 = ((g_qh_b1 >> (2u + is)) & 1u);
-            uint g_qh6 = ((g_qh_b1 >> (4u + is)) & 1u);
-            uint g_qh7 = ((g_qh_b1 >> (6u + is)) & 1u);
+            // Extract per-element qh bits: qh[pos_l+i] bit qh_bit
+            uint g_qh0 = (g_qh_word0 >> (0u * 8u + qh_bit)) & 1u;   // qh[pos_l+0]
+            uint g_qh1 = (g_qh_word0 >> (1u * 8u + qh_bit)) & 1u;   // qh[pos_l+1]
+            uint g_qh2 = (g_qh_word0 >> (2u * 8u + qh_bit)) & 1u;   // qh[pos_l+2]
+            uint g_qh3 = (g_qh_word0 >> (3u * 8u + qh_bit)) & 1u;   // qh[pos_l+3]
+            uint g_qh4 = (g_qh_word1 >> (0u * 8u + qh_bit)) & 1u;   // qh[pos_l+4]
+            uint g_qh5 = (g_qh_word1 >> (1u * 8u + qh_bit)) & 1u;   // qh[pos_l+5]
+            uint g_qh6 = (g_qh_word1 >> (2u * 8u + qh_bit)) & 1u;   // qh[pos_l+6]
+            uint g_qh7 = (g_qh_word1 >> (3u * 8u + qh_bit)) & 1u;   // qh[pos_l+7]
 
-            uint u_qh0 = ((u_qh_b0 >> (0u + is)) & 1u);
-            uint u_qh1 = ((u_qh_b0 >> (2u + is)) & 1u);
-            uint u_qh2 = ((u_qh_b0 >> (4u + is)) & 1u);
-            uint u_qh3 = ((u_qh_b0 >> (6u + is)) & 1u);
-            uint u_qh4 = ((u_qh_b1 >> (0u + is)) & 1u);
-            uint u_qh5 = ((u_qh_b1 >> (2u + is)) & 1u);
-            uint u_qh6 = ((u_qh_b1 >> (4u + is)) & 1u);
-            uint u_qh7 = ((u_qh_b1 >> (6u + is)) & 1u);
+            uint u_qh0 = (u_qh_word0 >> (0u * 8u + qh_bit)) & 1u;   // qh[pos_l+0]
+            uint u_qh1 = (u_qh_word0 >> (1u * 8u + qh_bit)) & 1u;   // qh[pos_l+1]
+            uint u_qh2 = (u_qh_word0 >> (2u * 8u + qh_bit)) & 1u;   // qh[pos_l+2]
+            uint u_qh3 = (u_qh_word0 >> (3u * 8u + qh_bit)) & 1u;   // qh[pos_l+3]
+            uint u_qh4 = (u_qh_word1 >> (0u * 8u + qh_bit)) & 1u;   // qh[pos_l+4]
+            uint u_qh5 = (u_qh_word1 >> (1u * 8u + qh_bit)) & 1u;   // qh[pos_l+5]
+            uint u_qh6 = (u_qh_word1 >> (2u * 8u + qh_bit)) & 1u;   // qh[pos_l+6]
+            uint u_qh7 = (u_qh_word1 >> (3u * 8u + qh_bit)) & 1u;   // qh[pos_l+7]
 
             // qs section: 128 bytes per row per block = 32 uint32 words
             uint data_section_base = panel_base_u32 + header_section_u32 + qh_section_u32;

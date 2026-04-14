@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Batch version of fused_add_norm for prefill.
 // One workgroup per token (gl_WorkGroupID.x = batch index).
@@ -22,7 +23,9 @@ layout(push_constant) uniform Params {
 #endif
 };
 
-shared float shared_sum[256];
+// f64 sum-of-squares to match llama.cpp's ggml_float; f32 drift compounds
+// across 40 layers and flips argmax in borderline cases.
+shared double shared_sum[256];
 
 void main() {
     uint batch_idx = gl_WorkGroupID.x;
@@ -31,7 +34,7 @@ void main() {
     uint base = batch_idx * dim;
 
     // Phase 1: optionally add residual, save to residual, compute sum of squares
-    float partial = 0.0;
+    double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
         float s = float(state[base + i]);
         if (apply_add != 0) {
@@ -42,7 +45,7 @@ void main() {
 #endif
         }
         residual[base + i] = float16_t(s);
-        float s_r = float(residual[base + i]);
+        double s_r = double(float(residual[base + i]));
         partial += s_r * s_r;
     }
     shared_sum[tid] = partial;
@@ -56,7 +59,7 @@ void main() {
         barrier();
     }
 
-    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
 
     // Phase 2: normalize and scale
     for (uint i = tid; i < dim; i += wg_size) {

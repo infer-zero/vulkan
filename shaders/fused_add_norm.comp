@@ -1,5 +1,6 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Fused: add_vectors + cmdCopy(state->residual) + rms_norm
 // When apply_add=1: state = norm((state + residual) * weights), residual = state + residual
@@ -23,14 +24,18 @@ layout(push_constant) uniform Params {
 #endif
 };
 
-shared float shared_sum[256];
+// f64 sum-of-squares accumulator: matches llama.cpp's ggml_float (= double) in
+// vec.h/vec.cpp. f32 accumulation drift compounds through tens of layers and
+// flips argmax at borderline-tied positions; this is the Vulkan analog of the
+// cpu/src/ops/common.zig rmsNorm fix (commit a724ebc).
+shared double shared_sum[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg_size = gl_WorkGroupSize.x;
 
     // Phase 1: optionally add residual, save to residual, compute sum of squares
-    float partial = 0.0;
+    double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
         float s = float(state[i]);
         if (apply_add != 0) {
@@ -40,9 +45,12 @@ void main() {
             s += float(residual[i]);
 #endif
         }
-        // Save combined value as new residual
+        // Save combined value as new residual, and use the f16-rounded value
+        // for sum-of-squares so inv_rms matches the values actually used in
+        // phase 2 (which reads `residual` after the f16 round-trip).
         residual[i] = float16_t(s);
-        partial += s * s;
+        double s_r = double(float(residual[i]));
+        partial += s_r * s_r;
     }
     shared_sum[tid] = partial;
     barrier();
@@ -55,7 +63,7 @@ void main() {
         barrier();
     }
 
-    float inv_rms = 1.0 / sqrt(shared_sum[0] / float(dim) + epsilon);
+    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
 
     // Phase 2: normalize and scale (read from residual which has the summed value)
     for (uint i = tid; i < dim; i += wg_size) {

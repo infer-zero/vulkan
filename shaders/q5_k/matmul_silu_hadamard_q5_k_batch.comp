@@ -131,8 +131,8 @@ void main() {
                 float u_dmin = unpackHalf2x16((u_h0 >> 16u) & 0xFFFFu).x;
 
                 float g_sc, g_mn, u_sc, u_mn;
-                unpackScaleMin(sub_block_in_sb, g_h1, g_h2, g_h3, g_sc, g_mn);
-                unpackScaleMin(sub_block_in_sb, u_h1, u_h2, u_h3, u_sc, u_mn);
+                unpackScaleMin(group + is_high * 4u, g_h1, g_h2, g_h3, g_sc, g_mn);  // Q5_K: j for low, j+4 for high
+                unpackScaleMin(group + is_high * 4u, u_h1, u_h2, u_h3, u_sc, u_mn);
 
                 float g_d_sc = g_d * g_sc;
                 float g_dmin_mn = g_dmin * g_mn;
