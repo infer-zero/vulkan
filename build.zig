@@ -55,6 +55,7 @@ const shared_shaders = [_]Shader{
     shader("shaders", "fused_add_norm_batch"),
     shader("shaders", "fused_rope_store_bf16"),
     shader("shaders", "fused_rope_store_bf16_batch"),
+    shader("shaders", "fused_rope_store_f16"),
     shader("shaders", "matmul_f32_logits"),
     shader("shaders", "rms_norm"),
     shader("shaders", "rope"),
@@ -62,6 +63,7 @@ const shared_shaders = [_]Shader{
     variant("shaders", "copy_embedding", "copy_embedding_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders", "add_vectors", "add_vectors_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders", "rope", "rope_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
+    variant("shaders", "fused_rope_store_f16", "fused_rope_store_f16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
 };
 
 const bf16_shaders = [_]Shader{
@@ -80,6 +82,7 @@ const bf16_shaders = [_]Shader{
 const q8_0_shaders = [_]Shader{
     shader("shaders/q8_0", "f16_to_bf16"),
     shader("shaders/q8_0", "f32_to_bf16"),
+    shader("shaders/q8_0", "f32_to_f16"),
     shader("shaders/q8_0", "matmul_q8_0_logits"),
     shader("shaders/q8_0", "matmul_silu_hadamard_q8_0"),
     shader("shaders/q8_0", "matmul_q8_0_panel_matvec"),
@@ -97,7 +100,9 @@ const q8_0_shaders = [_]Shader{
     // Variants
     variant("shaders/q8_0", "f16_to_bf16", "f16_to_bf16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders/q8_0", "f32_to_bf16", "f32_to_bf16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
+    variant("shaders/q8_0", "f32_to_f16", "f32_to_f16_batch", .vulkan1_1, &.{"-DBATCH_MODE"}),
     variant("shaders/q8_0", "matmul_q8_0_panel_matvec", "matmul_q8_0_panel_matvec_store_bf16", .vulkan1_1, &.{"-DSTORE_BF16_KV"}),
+    variant("shaders/q8_0", "matmul_q8_0_panel_matvec", "matmul_q8_0_panel_matvec_store_f16", .vulkan1_1, &.{"-DSTORE_F16_KV"}),
     variant("shaders/q8_0", "matmul_q8_0_batch", "matmul_q8_0_batch_idp", .vulkan1_3, &.{"-DIDP_MODE"}),
     variant("shaders/q8_0", "matmul_silu_hadamard_q8_0_batch", "matmul_silu_hadamard_q8_0_batch_idp", .vulkan1_3, &.{"-DIDP_MODE"}),
 };
