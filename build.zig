@@ -93,7 +93,8 @@ const q8_0_shaders = [_]Shader{
     shader("shaders/q8_0", "matmul_silu_hadamard_q8_0_batch_coop"),
     shader("shaders/q8_0", "rms_norm_batch"),
     shader("shaders/q8_0", "quantize_to_q8"),
-    // VK 1.3 (int8 coop)
+    // VK 1.3 (int8 coop + IDP decode)
+    shaderVk13("shaders/q8_0", "matmul_q8_0_decode_idp"),
     shaderVk13("shaders/q8_0", "matmul_q8_0_batch_coop_int8"),
     shaderVk13("shaders/q8_0", "matmul_silu_hadamard_q8_0_batch_coop_int8"),
     shaderVk13("shaders/q8_0", "matmul_q8_0_batch_coop_int8_ksplit"),
