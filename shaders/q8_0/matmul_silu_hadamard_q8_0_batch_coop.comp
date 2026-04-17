@@ -37,7 +37,8 @@ layout(push_constant) uniform Params {
 shared float16_t A_tile[TILE_M * A_STRIDE];
 shared float16_t G_tile[TILE_N * B_STRIDE];
 shared float16_t U_tile[TILE_N * B_STRIDE];
-shared float scratch[8 * 256];
+// fp16 acc path: scratch is fp16, convert on write-back for silu+hadamard f32 math.
+shared float16_t scratch[8 * 256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -62,14 +63,14 @@ void main() {
     uint scale_section_size = num_blocks * PANEL_N * 2;
 
     // Dual accumulators: gate and up, each 2x2 = 4 coop tiles per subgroup
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> g00 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> g01 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> g10 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> g11 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> u00 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> u01 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> u10 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> u11 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> g00 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> g01 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> g10 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> g11 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> u00 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> u01 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> u10 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> u11 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
 
     for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
         uint k_base = block_idx * 32;
@@ -165,7 +166,7 @@ void main() {
     coopMatStoreNV(g00, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
     float gate_cache[8];
-    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i * 32];
+    for (uint i = 0; i < 8; i++) gate_cache[i] = float(scratch[sb + sg_lane + i * 32]);
     coopMatStoreNV(u00, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
     for (uint i = 0; i < 8; i++) {
@@ -175,14 +176,14 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = silu * float(scratch[sb + idx]);
         }
     }
 
     // Tile (0,1): rows 0-15, cols 16-31
     coopMatStoreNV(g01, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
-    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i * 32];
+    for (uint i = 0; i < 8; i++) gate_cache[i] = float(scratch[sb + sg_lane + i * 32]);
     coopMatStoreNV(u01, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
     for (uint i = 0; i < 8; i++) {
@@ -192,14 +193,14 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = silu * float(scratch[sb + idx]);
         }
     }
 
     // Tile (1,0): rows 16-31, cols 0-15
     coopMatStoreNV(g10, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
-    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i * 32];
+    for (uint i = 0; i < 8; i++) gate_cache[i] = float(scratch[sb + sg_lane + i * 32]);
     coopMatStoreNV(u10, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
     for (uint i = 0; i < 8; i++) {
@@ -209,14 +210,14 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = silu * float(scratch[sb + idx]);
         }
     }
 
     // Tile (1,1): rows 16-31, cols 16-31
     coopMatStoreNV(g11, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
-    for (uint i = 0; i < 8; i++) gate_cache[i] = scratch[sb + sg_lane + i * 32];
+    for (uint i = 0; i < 8; i++) gate_cache[i] = float(scratch[sb + sg_lane + i * 32]);
     coopMatStoreNV(u11, scratch, sb, 16, false);
     subgroupMemoryBarrierShared();
     for (uint i = 0; i < 8; i++) {
@@ -226,7 +227,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = silu * float(scratch[sb + idx]);
         }
     }
 }
