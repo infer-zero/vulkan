@@ -238,10 +238,13 @@ pub const VulkanDevice = struct {
                             prop.m_size,               prop.n_size,
                             prop.k_size,               @intFromEnum(prop.scope),
                         });
-                        if (prop.a_type == .float16_khr and prop.b_type == .float16_khr) {
+                        // Compare via @intFromEnum: `prop.a_type == .float16_khr` silently
+                        // failed on non-exhaustive enum wrappers (float16_khr == 0, sint8_khr == 3
+                        // per vk.zig).
+                        if (@intFromEnum(prop.a_type) == 0 and @intFromEnum(prop.b_type) == 0) {
                             has_coop_matrix = true;
                         }
-                        if (prop.a_type == .sint8_khr and prop.b_type == .sint8_khr) {
+                        if (@intFromEnum(prop.a_type) == 3 and @intFromEnum(prop.b_type) == 3) {
                             has_coop_matrix_int8 = true;
                         }
                     }
