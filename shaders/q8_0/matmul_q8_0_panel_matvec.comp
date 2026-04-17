@@ -2,9 +2,11 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : enable
-#extension GL_ARB_gpu_shader_fp64 : enable
 
-// Panel-interleaved Q8_0 matvec: 128 threads (4 subgroups), 2 rows per WG.
+// Panel-interleaved Q8_0 matvec: 128 threads (4 subgroups), NUM_ROWS per WG.
+// Widening NUM_ROWS amortizes the per-WG activation read + in-shader quantization
+// across more output rows, cutting activation re-reads per token. Keep NUM_ROWS a
+// divisor of PANEL_N=128 so each WG fits inside one panel.
 // Weight buffer layout (panel-interleaved, PANEL_N=128):
 //   Per panel: [f16 scales: num_blocks * PANEL_N * 2B][i8 data: num_blocks * PANEL_N * 32B]
 // Accessed via uint weight_data[].
@@ -43,14 +45,14 @@ layout(push_constant) uniform Params {
     uint out_dim;
 };
 
+#ifndef NUM_ROWS
 #define NUM_ROWS 2
+#endif
 #define PANEL_N 128
 #define Q8_BLOCK_SIZE 34
 
-// Per-thread f64 partial sums, reduced in shared memory by thread 0 (no subgroupAdd
-// since f64 subgroup arithmetic isn't widely supported and a tree reduce in f32 would
-// erase the f64 precision we paid for in the inner loop).
-shared double tmpsh[NUM_ROWS][128];  // 2 x 128 = 2KB
+// Per-subgroup partials (4 subgroups of 32) → thread 0 reduces 4 values.
+shared float tmpsh[NUM_ROWS][4];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -82,11 +84,8 @@ void main() {
     uint scale_stride_u32 = PANEL_N / 2;   // PANEL_N * 2 bytes / 4
     uint data_stride_u32 = PANEL_N * 32 / 4; // PANEL_N * 32 bytes / 4
 
-    // f64 accumulator across blocks: per-block dot is f32-precise, but summing
-    // hundreds of `scale * dot_sum` contributions in f32 drifts. CPU's
-    // dotQ8_0_q8 uses f64 for the same reason — matches llama.cpp regime.
-    double temp[NUM_ROWS];
-    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0LF;
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
 
     uint input_base = tid * 8; // 8 f32 values per thread
     uint block_idx = (tid * 8) / 32;
@@ -144,59 +143,56 @@ void main() {
                 q6 * float(bitfieldExtract(int(w1), 16, 8)) +
                 q7 * float(bitfieldExtract(int(w1), 24, 8));
 
-            // llama.cpp's dotQ8_0_q8 multiplies the two f16/f32 scales in
-            // f64 before applying them to the integer block dot; our old
-            // `double(input_scale * weight_scale * dot_sum)` rounded the
-            // whole product to f32 first. Promoting each multiplicand to
-            // f64 independently tracks that. Validated against
-            // harness/tools/llama_ref_dump as the reference oracle.
-            temp[n] += double(input_scale) * double(weight_scale) * double(dot_sum);
+            temp[n] += input_scale * weight_scale * dot_sum;
         }
         block_idx += 32; // 1024 / 32
     }
 
-    // Reduce: subgroupAdd within each subgroup (cast to float since subgroup
-    // arithmetic doesn't support double on most desktop GPUs — partial sums
-    // here are small enough that the f32 reduction doesn't lose meaningful
-    // precision; the savings come from the inner accumulation in f64).
-    // Each thread writes its f64 partial to shared memory, thread 0 sums all 128.
+    // Reduce: subgroupAdd within each of 4 subgroups, then thread 0 sums
+    // the 4 subgroup partials via shared memory.
+    uint sg_id = tid / 32;
+    uint sg_lane = tid & 31;
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-        tmpsh[n][tid] = temp[n];
+        float sg_sum = subgroupAdd(temp[n]);
+        if (sg_lane == 0) tmpsh[n][sg_id] = sg_sum;
     }
     barrier();
 
     if (tid == 0) {
-        double row_sum[NUM_ROWS];
+        float row_sum[NUM_ROWS];
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            double s = 0.0LF;
-            for (uint i = 0; i < 128; i++) s += tmpsh[n][i];
-            row_sum[n] = s;
+            row_sum[n] = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
         }
 
 #ifdef STORE_KV
         uint kv_offset = dyn_position * out_dim;
-        float v0 = float(row_sum[0]);
-        if (first_row + 1 < out_dim) {
-            float v1 = float(row_sum[1]);
+        // Pack pairs of consecutive rows into uint32 KV slots.
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n += 2) {
+            uint row = first_row + n;
+            if (row + 1 < out_dim) {
+                float v0 = row_sum[n];
+                float v1 = row_sum[n + 1];
 #ifdef STORE_F16_KV
-            uint packed = packHalf2x16(vec2(v0, v1));
+                uint packed = packHalf2x16(vec2(v0, v1));
 #else
-            uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
+                uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
 #endif
-            kv_cache[(kv_offset + first_row) / 2] = packed;
-        } else if (first_row < out_dim) {
+                kv_cache[(kv_offset + row) / 2] = packed;
+            } else if (row < out_dim) {
+                float v0 = row_sum[n];
 #ifdef STORE_F16_KV
-            uint packed = packHalf2x16(vec2(v0, 0.0));
+                uint packed = packHalf2x16(vec2(v0, 0.0));
 #else
-            uint packed = (floatBitsToUint(v0) >> 16);
+                uint packed = (floatBitsToUint(v0) >> 16);
 #endif
-            kv_cache[(kv_offset + first_row) / 2] = packed;
+                kv_cache[(kv_offset + row) / 2] = packed;
+            }
         }
 #else
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
             if (row < out_dim) {
-                output_data[row] = float(row_sum[n]);
+                output_data[row] = row_sum[n];
             }
         }
 #endif

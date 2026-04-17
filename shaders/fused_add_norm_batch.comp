@@ -1,5 +1,4 @@
 #version 450
-#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Batch version of fused_add_norm for prefill.
 // One workgroup per token (gl_WorkGroupID.x = batch index).
@@ -22,9 +21,7 @@ layout(push_constant) uniform Params {
 #endif
 };
 
-// f64 sum-of-squares to match llama.cpp's ggml_float; f32 drift compounds
-// across 40 layers and flips argmax in borderline cases.
-shared double shared_sum[256];
+shared float shared_sum[256];
 
 void main() {
     uint batch_idx = gl_WorkGroupID.x;
@@ -32,14 +29,7 @@ void main() {
     uint wg_size = gl_WorkGroupSize.x;
     uint base = batch_idx * dim;
 
-    // Phase 1: f32 residual add + f64 sum-of-squares. The decode-path
-    // fused_add_norm.comp was upgraded to f64 residual+multiply and
-    // gained 60+ MATCH tokens; trying the same on this batch variant
-    // REGRESSED 4B tok500_4b_dec500 from 247 MATCH to 30 (first MISS at
-    // step 19). Llama.cpp's batched CPU path likely uses f32 adds here
-    // — over-precision during prefill diverges from its reference and
-    // cascades into decode via the KV cache.
-    double partial = 0.0LF;
+    float partial = 0.0;
     for (uint i = tid; i < dim; i += wg_size) {
         float s = state[base + i];
         if (apply_add != 0) {
@@ -50,13 +40,11 @@ void main() {
 #endif
         }
         residual[base + i] = s;
-        double s_r = double(s);
-        partial += s_r * s_r;
+        partial += s * s;
     }
     shared_sum[tid] = partial;
     barrier();
 
-    // Reduction in shared memory
     for (uint s = wg_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
             shared_sum[tid] += shared_sum[tid + s];
@@ -64,9 +52,8 @@ void main() {
         barrier();
     }
 
-    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
+    float inv_rms = inversesqrt(shared_sum[0] / float(dim) + epsilon);
 
-    // Phase 2: normalize and scale
     for (uint i = tid; i < dim; i += wg_size) {
         state[base + i] = residual[base + i] * inv_rms * weights[i];
     }

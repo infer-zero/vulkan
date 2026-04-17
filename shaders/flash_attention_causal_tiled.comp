@@ -41,10 +41,19 @@ shared uint k_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
 shared uint v_tile[TILE_KV * 64];  // 64 x 64 = 4096 uint32s = 16 KB
                                     // Total: 32 KB
 
-// Unpack 2 BF16 values from a packed uint32
-void unpackBf16Pair(uint packed, out float v0, out float v1) {
+// Unpack 2 packed half-precision values. KV cache format is selected at compile
+// time: BF16 (default) shifts the lower 16 bits to the upper 16 of the float;
+// F16 (-DKV_CACHE_F16) uses unpackHalf2x16 to honor the 5-bit exponent / 10-bit
+// mantissa layout that llama.cpp writes. Storage and read MUST agree.
+void unpackKvPair(uint packed, out float v0, out float v1) {
+#ifdef KV_CACHE_F16
+    vec2 vals = unpackHalf2x16(packed);
+    v0 = vals.x;
+    v1 = vals.y;
+#else
     v0 = uintBitsToFloat((packed & 0xFFFFu) << 16);
     v1 = uintBitsToFloat(packed & 0xFFFF0000u);
+#endif
 }
 
 void main() {
@@ -119,7 +128,7 @@ void main() {
             float dot_accum = 0.0;
             for (uint pass = 0; pass < dim_passes; pass++) {
                 float k0, k1;
-                unpackBf16Pair(k_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], k0, k1);
+                unpackKvPair(k_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], k0, k1);
                 dot_accum += rq[pass * 2] * k0 + rq[pass * 2 + 1] * k1;
             }
             float dot = subgroupAdd(dot_accum) * scale;
@@ -133,7 +142,7 @@ void main() {
             // Rescale accumulators and add V contribution from shared memory
             for (uint pass = 0; pass < dim_passes; pass++) {
                 float v0, v1;
-                unpackBf16Pair(v_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], v0, v1);
+                unpackKvPair(v_tile[pos_in_tile * packed_head_dim + pass * 32 + lane], v0, v1);
                 ov[pass * 2]     = ov[pass * 2]     * correction + p * v0;
                 ov[pass * 2 + 1] = ov[pass * 2 + 1] * correction + p * v1;
             }

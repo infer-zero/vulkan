@@ -20,8 +20,7 @@ layout(push_constant) uniform Params {
 #define TILE_K 256
 
 shared float input_tile[TILE_K];   // 1 KB
-shared float reduce[256];          // 1 KB
-                                    // Total: 2 KB
+shared float reduce[256];           // 1 KB
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -34,12 +33,10 @@ void main() {
     bool valid_row = global_row < out_dim;
 
     for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
-        // Cooperatively load 256 input elements into shared memory (coalesced)
         uint load_idx = tile_start + tid;
         input_tile[tid] = (load_idx < in_dim) ? input_data[load_idx] : 0.0;
         barrier();
 
-        // Each warp dots its weight row's tile (32 consecutive elements per step)
         if (valid_row) {
             uint tile_end = min(TILE_K, in_dim - tile_start);
             for (uint j = lane; j < tile_end; j += 32) {
@@ -49,7 +46,6 @@ void main() {
         barrier();
     }
 
-    // Parallel reduction: 32 threads per row -> 1 result
     reduce[tid] = sum;
     barrier();
     if (lane < 16) reduce[tid] += reduce[tid + 16];

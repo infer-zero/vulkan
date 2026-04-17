@@ -40,10 +40,21 @@ shared float smem_m[NUM_WARPS];
 shared float smem_l[NUM_WARPS];
 shared float smem_o[NUM_WARPS * 128]; // max head_dim=128
 
-// Unpack 2 BF16 values from a packed uint32
-void unpackBf16Pair(uint packed, out float v0, out float v1) {
+// Unpack 2 packed half-precision values. KV cache format is selected at compile
+// time: BF16 (default) shifts the lower 16 bits to the upper 16 of the float;
+// F16 (-DKV_CACHE_F16) uses unpackHalf2x16 to honor the 5-bit exponent / 10-bit
+// mantissa layout that llama.cpp writes. Storage and read MUST agree — using
+// the wrong unpack reinterprets the bit pattern as a totally different number
+// (e.g. F16 1.0 read as BF16 ≈ 0.0078).
+void unpackKvPair(uint packed, out float v0, out float v1) {
+#ifdef KV_CACHE_F16
+    vec2 vals = unpackHalf2x16(packed);
+    v0 = vals.x;
+    v1 = vals.y;
+#else
     v0 = uintBitsToFloat((packed & 0xFFFFu) << 16);
     v1 = uintBitsToFloat(packed & 0xFFFF0000u);
+#endif
 }
 
 void main() {
@@ -133,7 +144,7 @@ void main() {
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint packed_off = pos * packed_kv_stride + packed_kv_base + pass * 32;
             float k0, k1;
-            unpackBf16Pair(k_cache[packed_off + lane], k0, k1);
+            unpackKvPair(k_cache[packed_off + lane], k0, k1);
             dot_accum += rq[pass * 2] * k0 + rq[pass * 2 + 1] * k1;
         }
         float dot = subgroupAdd(dot_accum) * scale;
@@ -148,7 +159,7 @@ void main() {
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint packed_off = pos * packed_kv_stride + packed_kv_base + pass * 32;
             float v0, v1;
-            unpackBf16Pair(v_cache[packed_off + lane], v0, v1);
+            unpackKvPair(v_cache[packed_off + lane], v0, v1);
             ov[pass * 2]     = ov[pass * 2]     * correction + p * v0;
             ov[pass * 2 + 1] = ov[pass * 2 + 1] * correction + p * v1;
         }

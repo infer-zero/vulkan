@@ -1,5 +1,4 @@
 #version 450
-#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Coalesced matvec for logits with K-splitting. Same as matmul_q8_0.comp but F32 output.
 
@@ -21,7 +20,7 @@ layout(push_constant) uniform Params {
 #define K_SPLITS 4
 
 shared float input_tile[TILE_K];
-shared double partial_sums[512];  // f64 accumulator (matches CPU's dotQ8_0_q8)
+shared float partial_sums[512];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -30,7 +29,7 @@ void main() {
     uint lane = tid >> 7u;
     uint global_row = panel * PANEL_N + row_in_panel;
 
-    double sum = 0.0LF;
+    float sum = 0.0;
     bool valid_row = global_row < out_dim;
 
     uint num_blocks = in_dim / 32;
@@ -66,12 +65,7 @@ void main() {
                     block_sum += input_tile[base_q + 2] * float(bitfieldExtract(int(packed), 16, 8));
                     block_sum += input_tile[base_q + 3] * float(bitfieldExtract(int(packed), 24, 8));
                 }
-                // f64 scale multiply: block_sum is exact in f32 since the
-                // operands (q_round * int8) fit in f32's 24-bit integer
-                // mantissa — we don't need f64 here. But the scale × sum
-                // benefits from f64 multiplication to avoid per-block
-                // rounding drift compounded across 80 blocks.
-                sum += double(scale) * double(block_sum);
+                sum += scale * block_sum;
             }
         }
         barrier();
@@ -80,6 +74,6 @@ void main() {
     partial_sums[tid] = sum;
     barrier();
     if (lane == 0u && valid_row) {
-        output_data[global_row] = float(partial_sums[tid] + partial_sums[tid + 128] + partial_sums[tid + 256] + partial_sums[tid + 384]);
+        output_data[global_row] = partial_sums[tid] + partial_sums[tid + 128] + partial_sums[tid + 256] + partial_sums[tid + 384];
     }
 }

@@ -1,5 +1,4 @@
 #version 450
-#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Fused: add_vectors + cmdCopy(state->residual) + rms_norm
 // When apply_add=1: state = norm((state + residual) * weights), residual = state + residual
@@ -23,39 +22,28 @@ layout(push_constant) uniform Params {
 #endif
 };
 
-// f64 sum-of-squares accumulator: matches llama.cpp's ggml_float (= double) in
-// vec.h/vec.cpp. f32 accumulation drift compounds through tens of layers and
-// flips argmax at borderline-tied positions; this is the Vulkan analog of the
-// cpu/src/ops/common.zig rmsNorm fix (commit a724ebc).
-shared double shared_sum[256];
+shared float shared_sum[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg_size = gl_WorkGroupSize.x;
 
-    // Phase 1: optionally add residual (in f64 to avoid f32 rounding in
-    // the add), save f32-rounded result to residual buffer, accumulate
-    // sum-of-squares in f64. The f32 storage rounding is unavoidable
-    // (residual buffer is f32), but doing the add in f64 avoids an extra
-    // rounding step when both operands are close.
-    double partial = 0.0LF;
+    float partial = 0.0;
     for (uint i = tid; i < dim; i += wg_size) {
-        double s_d = double(state[i]);
+        float s = state[i];
         if (apply_add != 0) {
 #ifdef RESIDUAL_SCALE
-            s_d = s_d * double(residual_scale) + double(residual[i]);
+            s = s * residual_scale + residual[i];
 #else
-            s_d += double(residual[i]);
+            s += residual[i];
 #endif
         }
-        const float s = float(s_d);
         residual[i] = s;
-        partial += double(s) * double(s);
+        partial += s * s;
     }
     shared_sum[tid] = partial;
     barrier();
 
-    // Reduction in shared memory
     for (uint s = wg_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
             shared_sum[tid] += shared_sum[tid + s];
@@ -63,11 +51,9 @@ void main() {
         barrier();
     }
 
-    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
+    float inv_rms = inversesqrt(shared_sum[0] / float(dim) + epsilon);
 
-    // Phase 2: normalize + scale. f64 multiply chain avoids the per-dim
-    // f32-triple-multiply drift that compounds across 28 layers.
     for (uint i = tid; i < dim; i += wg_size) {
-        state[i] = float(double(residual[i]) * double(inv_rms) * double(weights[i]));
+        state[i] = residual[i] * inv_rms * weights[i];
     }
 }
