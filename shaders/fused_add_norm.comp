@@ -33,20 +33,24 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint wg_size = gl_WorkGroupSize.x;
 
-    // Phase 1: optionally add residual, save to residual, compute sum of squares
+    // Phase 1: optionally add residual (in f64 to avoid f32 rounding in
+    // the add), save f32-rounded result to residual buffer, accumulate
+    // sum-of-squares in f64. The f32 storage rounding is unavoidable
+    // (residual buffer is f32), but doing the add in f64 avoids an extra
+    // rounding step when both operands are close.
     double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
-        float s = state[i];
+        double s_d = double(state[i]);
         if (apply_add != 0) {
 #ifdef RESIDUAL_SCALE
-            s = s * residual_scale + residual[i];
+            s_d = s_d * double(residual_scale) + double(residual[i]);
 #else
-            s += residual[i];
+            s_d += double(residual[i]);
 #endif
         }
+        const float s = float(s_d);
         residual[i] = s;
-        double s_r = double(s);
-        partial += s_r * s_r;
+        partial += double(s) * double(s);
     }
     shared_sum[tid] = partial;
     barrier();
@@ -61,8 +65,9 @@ void main() {
 
     float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
 
-    // Phase 2: normalize and scale (read from residual which has the summed value)
+    // Phase 2: normalize + scale. f64 multiply chain avoids the per-dim
+    // f32-triple-multiply drift that compounds across 28 layers.
     for (uint i = tid; i < dim; i += wg_size) {
-        state[i] = residual[i] * inv_rms * weights[i];
+        state[i] = float(double(residual[i]) * double(inv_rms) * double(weights[i]));
     }
 }

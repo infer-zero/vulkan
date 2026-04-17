@@ -183,7 +183,12 @@ void main() {
 
         uint a_row0 = m_base + sg_m_base;
 
-        // M-row 0
+        // M-row 0. Scales stay in f32 here (unlike the panel-matvec shader)
+        // because the coop path matches llama.cpp's Vulkan prefill regime,
+        // which also uses f32 multiplies. Verified empirically: promoting
+        // to f64 in this shader *regressed* 4B tok500_4b_dec100 from 101
+        // MATCH to 41 (first MISS at step 12) against llama.cpp — the tighter
+        // rounding crossed tie boundaries and diverged trajectories earlier.
         coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)

@@ -70,6 +70,13 @@ pub const VulkanDevice = struct {
     // Memory tracking
     allocated_bytes: usize,
 
+    // Persistent upload staging buffer, grown to the high-water-mark of all
+    // uploadToBuffer calls. Avoids the allocate/destroy churn of creating
+    // a fresh host-visible staging buffer per tensor (40+ cycles for a 4B
+    // model init) and keeps peak-during-upload bounded by the largest
+    // single tensor instead of (cumulative device-local + current staging).
+    upload_staging: ?GpuBuffer,
+
     // Dynamic library handle
     vk_lib: std.DynLib,
 
@@ -497,6 +504,7 @@ pub const VulkanDevice = struct {
             .min_subgroup_size = min_subgroup_size,
             .has_subgroup_size_control = has_subgroup_size_control,
             .allocated_bytes = 0,
+            .upload_staging = null,
             .vk_lib = vk_lib,
         };
 
@@ -505,6 +513,7 @@ pub const VulkanDevice = struct {
 
     pub fn deinit(self: *Self) void {
         self.vkd.deviceWaitIdle(self.device) catch {};
+        if (self.upload_staging) |s| self.destroyBuffer(s);
         self.vkd.destroyDescriptorPool(self.device, self.descriptor_pool, null);
         self.vkd.destroyCommandPool(self.device, self.command_pool, null);
         self.vkd.destroyDevice(self.device, null);
@@ -591,12 +600,7 @@ pub const VulkanDevice = struct {
     }
 
     pub fn uploadToBuffer(self: *Self, dst: GpuBuffer, data: []const u8) !void {
-        const staging = try self.createBuffer(
-            data.len,
-            .{ .transfer_src_bit = true },
-            false,
-        );
-        defer self.destroyBuffer(staging);
+        const staging = try self.ensureUploadStaging(data.len);
 
         @memcpy(staging.mapped.?[0..data.len], data);
 
@@ -610,6 +614,24 @@ pub const VulkanDevice = struct {
         try self.endCommandBuffer(cmd);
         try self.submitAndWait(cmd);
         self.freeCommandBuffer(cmd);
+    }
+
+    // Returns a persistent host-visible staging buffer at least `size`
+    // bytes. Reuses across `uploadToBuffer` calls so weight upload for a
+    // multi-GB model doesn't thrash the Vulkan allocator with 40+ tiny
+    // alloc/free cycles, and the peak-during-upload footprint stays
+    // bounded by the largest single tensor instead of cumulative.
+    fn ensureUploadStaging(self: *Self, size: vk.DeviceSize) !GpuBuffer {
+        if (self.upload_staging) |existing| {
+            if (existing.size >= size) return existing;
+            // Grow: wait for any in-flight copies before freeing.
+            self.vkd.deviceWaitIdle(self.device) catch {};
+            self.destroyBuffer(existing);
+            self.upload_staging = null;
+        }
+        const fresh = try self.createBuffer(size, .{ .transfer_src_bit = true }, false);
+        self.upload_staging = fresh;
+        return fresh;
     }
 
     pub fn downloadFromBuffer(self: *Self, src: GpuBuffer, dst: []u8) !void {

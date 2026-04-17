@@ -32,7 +32,13 @@ void main() {
     uint wg_size = gl_WorkGroupSize.x;
     uint base = batch_idx * dim;
 
-    // Phase 1: optionally add residual, save to residual, compute sum of squares
+    // Phase 1: f32 residual add + f64 sum-of-squares. The decode-path
+    // fused_add_norm.comp was upgraded to f64 residual+multiply and
+    // gained 60+ MATCH tokens; trying the same on this batch variant
+    // REGRESSED 4B tok500_4b_dec500 from 247 MATCH to 30 (first MISS at
+    // step 19). Llama.cpp's batched CPU path likely uses f32 adds here
+    // — over-precision during prefill diverges from its reference and
+    // cascades into decode via the KV cache.
     double partial = 0.0LF;
     for (uint i = tid; i < dim; i += wg_size) {
         float s = state[base + i];

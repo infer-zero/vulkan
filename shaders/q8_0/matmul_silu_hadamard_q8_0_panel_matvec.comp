@@ -1,6 +1,8 @@
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_ARB_gpu_shader_fp64 : enable
 
 // Fused gate+up matvec with SiLU+Hadamard: panel-interleaved Q8_0, 128 threads, 2 rows/WG.
 // Computes: output[i] = silu(gate[i]) * up[i]
@@ -23,8 +25,9 @@ layout(push_constant) uniform Params {
 #define PANEL_N 128
 #define Q8_BLOCK_SIZE 34
 
-shared float gate_sh[NUM_ROWS][4];
-shared float up_sh[NUM_ROWS][4];
+// Per-thread f64 partial sums; reduced by thread 0 (subgroupAdd doesn't preserve f64).
+shared double gate_sh[NUM_ROWS][128];
+shared double up_sh[NUM_ROWS][128];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -53,11 +56,12 @@ void main() {
     uint scale_stride_u32 = PANEL_N / 2;
     uint data_stride_u32 = PANEL_N * 32 / 4;
 
-    float gate_temp[NUM_ROWS];
-    float up_temp[NUM_ROWS];
+    // f64 accumulator across blocks: matches CPU's dotQ8_0_q8.
+    double gate_temp[NUM_ROWS];
+    double up_temp[NUM_ROWS];
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-        gate_temp[n] = 0.0;
-        up_temp[n] = 0.0;
+        gate_temp[n] = 0.0LF;
+        up_temp[n] = 0.0LF;
     }
 
     uint input_base = tid * 8;
@@ -74,6 +78,25 @@ void main() {
         float b7 = input_data[input_base + 7];
         input_base += 1024;
 
+        // Per-block Q8_0 quantization (matches llama.cpp / our CPU):
+        // 4 threads share a 32-element block, max-reduce via XOR shuffles, then
+        // quantize to i8 floats so the dot matches the Q8 behaviour the model
+        // was calibrated against.
+        float local_max = max(max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3))),
+                              max(max(abs(b4), abs(b5)), max(abs(b6), abs(b7))));
+        local_max = max(local_max, subgroupShuffleXor(local_max, 1));
+        local_max = max(local_max, subgroupShuffleXor(local_max, 2));
+        float input_scale = local_max / 127.0;
+        float inv_input_scale = (local_max > 0.0) ? (127.0 / local_max) : 0.0;
+        float q0 = round(b0 * inv_input_scale);
+        float q1 = round(b1 * inv_input_scale);
+        float q2 = round(b2 * inv_input_scale);
+        float q3 = round(b3 * inv_input_scale);
+        float q4 = round(b4 * inv_input_scale);
+        float q5 = round(b5 * inv_input_scale);
+        float q6 = round(b6 * inv_input_scale);
+        float q7 = round(b7 * inv_input_scale);
+
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
             if (row >= out_dim) break;
@@ -82,53 +105,49 @@ void main() {
             uint di = data_base_u32[n] + block_idx * data_stride_u32;
 
             // Gate weight
-            float g_scale = unpackHalf2x16((gate_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+            float g_weight_scale = unpackHalf2x16((gate_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
             uint gw0 = gate_weight_data[di];
             uint gw1 = gate_weight_data[di + 1];
 
             float g_dot =
-                b0 * float(bitfieldExtract(int(gw0), 0, 8)) +
-                b1 * float(bitfieldExtract(int(gw0), 8, 8)) +
-                b2 * float(bitfieldExtract(int(gw0), 16, 8)) +
-                b3 * float(bitfieldExtract(int(gw0), 24, 8)) +
-                b4 * float(bitfieldExtract(int(gw1), 0, 8)) +
-                b5 * float(bitfieldExtract(int(gw1), 8, 8)) +
-                b6 * float(bitfieldExtract(int(gw1), 16, 8)) +
-                b7 * float(bitfieldExtract(int(gw1), 24, 8));
+                q0 * float(bitfieldExtract(int(gw0), 0, 8)) +
+                q1 * float(bitfieldExtract(int(gw0), 8, 8)) +
+                q2 * float(bitfieldExtract(int(gw0), 16, 8)) +
+                q3 * float(bitfieldExtract(int(gw0), 24, 8)) +
+                q4 * float(bitfieldExtract(int(gw1), 0, 8)) +
+                q5 * float(bitfieldExtract(int(gw1), 8, 8)) +
+                q6 * float(bitfieldExtract(int(gw1), 16, 8)) +
+                q7 * float(bitfieldExtract(int(gw1), 24, 8));
 
-            gate_temp[n] += g_scale * g_dot;
+            // f64 scale multiply — mirrors matmul_q8_0_panel_matvec.comp and
+            // CPU's dotQ8_0_q8; verified to close argmax-divergence steps
+            // from 2 to 47+ on Qwen3-0.6B-Q8_0 vs llama.cpp reference.
+            gate_temp[n] += double(input_scale) * double(g_weight_scale) * double(g_dot);
 
             // Up weight
-            float u_scale = unpackHalf2x16((up_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+            float u_weight_scale = unpackHalf2x16((up_weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
             uint uw0 = up_weight_data[di];
             uint uw1 = up_weight_data[di + 1];
 
             float u_dot =
-                b0 * float(bitfieldExtract(int(uw0), 0, 8)) +
-                b1 * float(bitfieldExtract(int(uw0), 8, 8)) +
-                b2 * float(bitfieldExtract(int(uw0), 16, 8)) +
-                b3 * float(bitfieldExtract(int(uw0), 24, 8)) +
-                b4 * float(bitfieldExtract(int(uw1), 0, 8)) +
-                b5 * float(bitfieldExtract(int(uw1), 8, 8)) +
-                b6 * float(bitfieldExtract(int(uw1), 16, 8)) +
-                b7 * float(bitfieldExtract(int(uw1), 24, 8));
+                q0 * float(bitfieldExtract(int(uw0), 0, 8)) +
+                q1 * float(bitfieldExtract(int(uw0), 8, 8)) +
+                q2 * float(bitfieldExtract(int(uw0), 16, 8)) +
+                q3 * float(bitfieldExtract(int(uw0), 24, 8)) +
+                q4 * float(bitfieldExtract(int(uw1), 0, 8)) +
+                q5 * float(bitfieldExtract(int(uw1), 8, 8)) +
+                q6 * float(bitfieldExtract(int(uw1), 16, 8)) +
+                q7 * float(bitfieldExtract(int(uw1), 24, 8));
 
-            up_temp[n] += u_scale * u_dot;
+            up_temp[n] += double(input_scale) * double(u_weight_scale) * double(u_dot);
         }
         block_idx += 32;
     }
 
-    // Reduce
+    // Each thread writes its f64 partial; thread 0 sums all 128.
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-        gate_temp[n] = subgroupAdd(gate_temp[n]);
-        up_temp[n] = subgroupAdd(up_temp[n]);
-    }
-
-    if (gl_SubgroupInvocationID == 0) {
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            gate_sh[n][gl_SubgroupID] = gate_temp[n];
-            up_sh[n][gl_SubgroupID] = up_temp[n];
-        }
+        gate_sh[n][tid] = gate_temp[n];
+        up_sh[n][tid] = up_temp[n];
     }
     barrier();
 
@@ -136,8 +155,14 @@ void main() {
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
             if (row < out_dim) {
-                float g = gate_sh[n][0] + gate_sh[n][1] + gate_sh[n][2] + gate_sh[n][3];
-                float u = up_sh[n][0] + up_sh[n][1] + up_sh[n][2] + up_sh[n][3];
+                double gs = 0.0LF;
+                double us = 0.0LF;
+                for (uint i = 0; i < 128; i++) {
+                    gs += gate_sh[n][i];
+                    us += up_sh[n][i];
+                }
+                float g = float(gs);
+                float u = float(us);
                 float silu_g = g / (1.0 + exp(-g));
                 output_data[row] = silu_g * u;
             }

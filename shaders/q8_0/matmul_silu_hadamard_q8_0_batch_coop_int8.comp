@@ -163,7 +163,9 @@ void main() {
 
         uint a_row0 = m_base + sg_m_base;
 
-        // M-row 0
+        // M-row 0. Scales in f32; see matmul_q8_0_batch_coop_int8.comp for
+        // the note on why the coop path stays f32 (matches llama.cpp Vulkan
+        // prefill regime; f64 promotion crossed tie boundaries empirically).
         coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
 
         s32_result = coopMatMulAdd(a_i8, gb0_i8, s32_zero);
