@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -10,18 +9,18 @@
 // Low nibble = elements 0-15, high nibble = elements 16-31.
 //
 // Variants:
-//   (none)         -> f16 output (3buf: input, weights, output)
+//   (none)         -> f32 output (3buf: input, weights, output)
 //   STORE_BF16_KV  -> BF16 KV cache write (3buf + dyn: input, weights, kv_cache + dynamic)
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
 #ifdef STORE_BF16_KV
 layout(set = 0, binding = 2) buffer KVCache { uint kv_cache[]; };
 layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
 #else
-layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
 #endif
 
 layout(push_constant) uniform Params {
@@ -72,16 +71,20 @@ void main() {
     float temp[NUM_ROWS];
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
 
-    uint input_base = tid * 4;
+    uint input_base = tid * 8;
     uint block_idx = (tid * 8) / 32;
 
     for (uint col = tid * 8; col < in_dim; col += 1024) {
-        // Read 8 input f16 values as 4 packed uint32
-        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
-        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
-        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
-        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
-        input_base += 512; // 1024 / 2
+        // Read 8 input f32 values
+        float i0 = input_data[input_base + 0];
+        float i1 = input_data[input_base + 1];
+        float i2 = input_data[input_base + 2];
+        float i3 = input_data[input_base + 3];
+        float i4 = input_data[input_base + 4];
+        float i5 = input_data[input_base + 5];
+        float i6 = input_data[input_base + 6];
+        float i7 = input_data[input_base + 7];
+        input_base += 1024;
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
@@ -97,14 +100,14 @@ void main() {
             uint w1 = weight_data[di + 1];
 
             float dot_sum =
-                b01.x * float(int((w0 >> nibble_shift) & 0xFu) - 8) +
-                b01.y * float(int((w0 >> (8u + nibble_shift)) & 0xFu) - 8) +
-                b23.x * float(int((w0 >> (16u + nibble_shift)) & 0xFu) - 8) +
-                b23.y * float(int((w0 >> (24u + nibble_shift)) & 0xFu) - 8) +
-                b45.x * float(int((w1 >> nibble_shift) & 0xFu) - 8) +
-                b45.y * float(int((w1 >> (8u + nibble_shift)) & 0xFu) - 8) +
-                b67.x * float(int((w1 >> (16u + nibble_shift)) & 0xFu) - 8) +
-                b67.y * float(int((w1 >> (24u + nibble_shift)) & 0xFu) - 8);
+                i0 * float(int((w0 >> nibble_shift) & 0xFu) - 8) +
+                i1 * float(int((w0 >> (8u + nibble_shift)) & 0xFu) - 8) +
+                i2 * float(int((w0 >> (16u + nibble_shift)) & 0xFu) - 8) +
+                i3 * float(int((w0 >> (24u + nibble_shift)) & 0xFu) - 8) +
+                i4 * float(int((w1 >> nibble_shift) & 0xFu) - 8) +
+                i5 * float(int((w1 >> (8u + nibble_shift)) & 0xFu) - 8) +
+                i6 * float(int((w1 >> (16u + nibble_shift)) & 0xFu) - 8) +
+                i7 * float(int((w1 >> (24u + nibble_shift)) & 0xFu) - 8);
 
             temp[n] += scale * dot_sum;
         }
@@ -141,7 +144,7 @@ void main() {
             uint row = first_row + n;
             if (row < out_dim) {
                 float result = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
-                output_data[row] = float16_t(result);
+                output_data[row] = result;
             }
         }
 #endif

@@ -23,9 +23,9 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -77,7 +77,7 @@ void main() {
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? input_data[gm * in_dim + k_base + k] : float16_t(0.0);
+                ? float16_t(input_data[gm * in_dim + k_base + k]) : float16_t(0.0);
         }
 
         // Load B tile: Q4_0 dequant to f16 in shared (4 uint32 words = 32 nibble values)
@@ -157,7 +157,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc01, scratch, sb, 16, false);
@@ -166,7 +166,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc10, scratch, sb, 16, false);
@@ -175,7 +175,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc11, scratch, sb, 16, false);
@@ -184,7 +184,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc20, scratch, sb, 16, false);
@@ -193,7 +193,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc21, scratch, sb, 16, false);
@@ -202,7 +202,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc30, scratch, sb, 16, false);
@@ -211,7 +211,7 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     coopMatStoreNV(acc31, scratch, sb, 16, false);
@@ -220,6 +220,6 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 }

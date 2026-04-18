@@ -22,10 +22,10 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -69,7 +69,7 @@ void main() {
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+                ? input_data[gm * in_dim + k_base + k] : 0.0;
         }
 
         // Load Gate and Up tiles: Q4_0 dequant (4 uint32 words = 32 nibble values)
@@ -147,7 +147,7 @@ void main() {
             if (gn < out_dim) {
                 float gate = gate_acc[i * THREAD_N + j];
                 float silu = gate / (1.0 + exp(-gate));
-                output_data[gm * out_dim + gn] = float16_t(silu * up_acc[i * THREAD_N + j]);
+                output_data[gm * out_dim + gn] = silu * up_acc[i * THREAD_N + j];
             }
         }
     }

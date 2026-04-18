@@ -36,7 +36,7 @@ layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer readonly Input { int8_t input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -207,7 +207,7 @@ void main() {
             uint gm = out_m + m_off + i / 16;                                               \
             uint gn = out_n + n_off + i % 16;                                               \
             if (gm < batch_size && gn < out_dim)                                             \
-                output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);                 \
+                output_data[gm * out_dim + gn] = scratch[sb + i];                             \
         }
 
     WRITE_TILE(acc00,  0,  0)
