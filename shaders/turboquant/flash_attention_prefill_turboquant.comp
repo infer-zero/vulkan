@@ -3,15 +3,15 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// TurboQuant MSE-only prefill attention with causal masking.
+// TurboQuant (RHT + 3-bit MSE + 1-bit QJL) prefill attention with causal masking.
 // Dispatch: (ceil(batch_size/TILE_Q) * num_heads, 1, 1)
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 0) buffer readonly Query { float query_data[]; };
 layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
 layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 layout(set = 0, binding = 4) buffer readonly SignFlips { float sign_data[]; };
 
 layout(push_constant) uniform PC {
@@ -32,6 +32,7 @@ layout(push_constant) uniform PC {
 #define TILE_KV 32
 
 shared float q_rot_tile[TILE_Q * 128];
+shared float q_qjl_tile[TILE_Q * 128];
 shared float dot_scores[TILE_Q * TILE_KV];
 shared float dequant_v[TILE_KV * 128];
 shared float q_temp[128];
@@ -45,22 +46,29 @@ void main() {
     uint kv_head = head / queries_per_kv;
     uint kv_heads = num_heads / queries_per_kv;
 
-    uint sign_offset = layer_idx * head_dim;
+    uint rht_sign_offset = layer_idx * head_dim * 2;
+    uint qjl_sign_offset = layer_idx * head_dim * 2 + head_dim;
     uint half_dim = head_dim / 2;
     float rht_scale = 1.0 / sqrt(float(head_dim));
 
     uint mse_words = (head_dim * 3 + 31) / 32;
-    uint key_u32s = 1 + mse_words;
-    uint data_words_v = head_dim / 16;
+    uint qjl_words = head_dim / 32;
+    uint key_u32s = 1 + mse_words + 1 + qjl_words;
+    uint data_words_v = head_dim / 8;
     uint groups_per_head = head_dim / 32;
     uint scale_words_v = (groups_per_head + 1) / 2;
     uint val_u32s = data_words_v + scale_words_v + scale_words_v;
 
-    // ---- Phase 0: Pre-rotate all TILE_Q queries via RHT ----
+    const float QJL_SCALE = 1.2533141 / float(head_dim); // sqrt(pi/2) / d
+
+    // ---- Phase 0: Pre-rotate all TILE_Q queries via RHT and QJL ----
     for (uint qi = 0; qi < TILE_Q; qi++) {
         uint query_idx = q_tile_idx * TILE_Q + qi;
         if (query_idx >= batch_size) {
-            if (tid < head_dim) q_rot_tile[qi * head_dim + tid] = 0.0;
+            if (tid < head_dim) {
+                q_rot_tile[qi * head_dim + tid] = 0.0;
+                q_qjl_tile[qi * head_dim + tid] = 0.0;
+            }
             barrier();
             continue;
         }
@@ -83,7 +91,7 @@ void main() {
         barrier();
 
         // RHT
-        if (tid < head_dim) q_temp[tid] *= sign_data[sign_offset + tid];
+        if (tid < head_dim) q_temp[tid] *= sign_data[rht_sign_offset + tid];
         barrier();
         for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
             if (tid < head_dim && (tid & stride) == 0) {
@@ -94,7 +102,27 @@ void main() {
             }
             barrier();
         }
-        if (tid < head_dim) q_rot_tile[qi * head_dim + tid] = q_temp[tid] * rht_scale;
+        // q_temp now holds H D_rht RoPE(q). Scale and store to q_rot_tile.
+        if (tid < head_dim) {
+            float qr = q_temp[tid] * rht_scale;
+            q_rot_tile[qi * head_dim + tid] = qr;
+            q_temp[tid] = qr; // seed q_temp with the scaled post-RHT query for QJL
+        }
+        barrier();
+
+        // QJL: apply D_qjl sign flips + WHT + scale
+        if (tid < head_dim) q_temp[tid] *= sign_data[qjl_sign_offset + tid];
+        barrier();
+        for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
+            if (tid < head_dim && (tid & stride) == 0) {
+                float a = q_temp[tid];
+                float b = q_temp[tid | stride];
+                q_temp[tid] = a + b;
+                q_temp[tid | stride] = a - b;
+            }
+            barrier();
+        }
+        if (tid < head_dim) q_qjl_tile[qi * head_dim + tid] = q_temp[tid] * rht_scale;
         barrier();
     }
 
@@ -115,7 +143,7 @@ void main() {
     for (uint kv_tile = 0; kv_tile < max_kv_count; kv_tile += TILE_KV) {
         uint tile_size = min(TILE_KV, max_kv_count - kv_tile);
 
-        // ---- Compute Q.K scores ----
+        // ---- Compute Q.K scores (MSE + QJL correction) ----
         for (uint idx = tid; idx < TILE_Q * tile_size; idx += 256) {
             uint qi = idx / tile_size;
             uint ki = idx % tile_size;
@@ -129,9 +157,11 @@ void main() {
 
             uint key_base = kv_pos * key_u32_per_pos + key_head_off;
             float k_norm = uintBitsToFloat(k_cache[key_base]);
+            float res_norm = uintBitsToFloat(k_cache[key_base + 1 + mse_words]);
 
-            // 3-bit MSE score
+            // 3-bit MSE score + 1-bit QJL residual correction
             float mse_score = 0.0;
+            float qjl_score = 0.0;
             for (uint d = 0; d < head_dim; d++) {
                 uint bit_pos = d * 3;
                 uint word = bit_pos / 32;
@@ -140,20 +170,26 @@ void main() {
                 uint c_idx = (raw >> bit) & 7u;
                 if (bit > 29) c_idx |= (k_cache[key_base + 1 + word + 1] << (32 - bit)) & 7u;
                 mse_score += q_rot_tile[qi * head_dim + d] * cen[c_idx];
+
+                uint qjl_word = d / 32;
+                uint qjl_raw = k_cache[key_base + 1 + mse_words + 1 + qjl_word];
+                float qjl_sign = ((qjl_raw >> (d % 32)) & 1u) != 0u ? 1.0 : -1.0;
+                qjl_score += q_qjl_tile[qi * head_dim + d] * qjl_sign;
             }
-            dot_scores[qi * TILE_KV + ki] = mse_score * k_norm * scale;
+            float combined = mse_score + qjl_score * (QJL_SCALE * res_norm);
+            dot_scores[qi * TILE_KV + ki] = combined * k_norm * scale;
         }
         barrier();
 
-        // ---- Dequantize values ----
+        // ---- Dequantize values (4-bit) ----
         for (uint idx = tid; idx < tile_size * head_dim; idx += 256) {
             uint ki = idx / head_dim;
             uint d = idx % head_dim;
             uint kv_pos = kv_tile + ki;
             uint val_base = kv_pos * val_u32_per_pos + val_head_off;
 
-            uint dw = val_base + d / 16;
-            uint q_val = (v_cache[dw] >> ((d % 16) * 2)) & 3u;
+            uint dw = val_base + d / 8;
+            uint q_val = (v_cache[dw] >> ((d % 8) * 4)) & 0xFu;
 
             uint grp = d / 32;
             uint so = val_base + data_words_v + grp / 2;
@@ -199,7 +235,7 @@ void main() {
             if (query_idx >= batch_size) continue;
             uint out_base = query_idx * num_heads * head_dim + head * head_dim;
             float inv_l = (l_vals[qi] > 0.0) ? (1.0 / l_vals[qi]) : 0.0;
-            output_data[out_base + tid] = float16_t(ov_vals[qi] * inv_l);
+            output_data[out_base + tid] = ov_vals[qi] * inv_l;
         }
     }
 }

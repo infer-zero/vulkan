@@ -1,13 +1,13 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// Group quantization for value cache: 2-bit asymmetric min-max per group of 32.
+// Group quantization for value cache: 4-bit asymmetric min-max per group of 32.
 //
 // Value buffer layout per head (variable, depends on head_dim):
-//   uint32[0..data_words-1]:                    2-bit packed data (head_dim values)
+//   uint32[0..data_words-1]:                    4-bit packed data (head_dim values)
 //   uint32[data_words..data_words+scale_words-1]: f16 group scales (2 per u32)
 //   uint32[...]:                                  f16 group zeros (2 per u32)
-//   where data_words = head_dim/16, scale_words = ceil(groups/2), groups = head_dim/32
+//   where data_words = head_dim/8, scale_words = ceil(groups/2), groups = head_dim/32
 //
 // Variants:
 //   (none)       -> single-token decode, position from dynamic params SSBO
@@ -15,7 +15,7 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
+layout(set = 0, binding = 0) buffer readonly Src { float src_data[]; };
 layout(set = 0, binding = 1) buffer Dst { uint dst_data[]; };
 
 #ifdef BATCH_MODE
@@ -42,7 +42,7 @@ shared float values[4096];  // max kv_dim
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint groups_per_head = head_dim / GROUP_SIZE;
-    uint data_words = head_dim / 16;                  // 2-bit packed: 16 values per u32
+    uint data_words = head_dim / 8;                   // 4-bit packed: 8 values per u32
     uint scale_words = (groups_per_head + 1) / 2;     // 2 f16 per u32
     uint u32s_per_head = data_words + scale_words + scale_words;
 
@@ -54,12 +54,12 @@ void main() {
     uint position = dyn_position;
 #endif
 
-    // Phase 1: Load f16 values to shared memory
+    // Phase 1: Load f32 values to shared memory
     for (uint idx = tid; idx < kv_dim; idx += 256) {
 #ifdef BATCH_MODE
-        values[idx] = float(src_data[src_batch_offset + idx]);
+        values[idx] = src_data[src_batch_offset + idx];
 #else
-        values[idx] = float(src_data[idx]);
+        values[idx] = src_data[idx];
 #endif
     }
     barrier();
@@ -84,20 +84,20 @@ void main() {
                 v_max = max(v_max, v);
             }
 
-            // Compute scale: (max - min) / 3 for 2-bit (4 levels: 0,1,2,3)
-            float sc = (v_max - v_min) / 3.0;
+            // Compute scale: (max - min) / 15 for 4-bit (16 levels: 0..15)
+            float sc = (v_max - v_min) / 15.0;
             if (sc < 1e-10) sc = 1e-10;
             float inv_sc = 1.0 / sc;
 
-            // Quantize and pack: 16 values per uint32 (2-bit each)
-            for (uint w = 0; w < 2; w++) {
+            // Quantize and pack: 8 values per uint32 (4-bit each), 4 u32s per group of 32
+            for (uint w = 0; w < 4; w++) {
                 uint packed = 0u;
-                for (uint i = 0; i < 16; i++) {
-                    float v = values[grp_off + w * 16 + i];
-                    float q = clamp(round((v - v_min) * inv_sc), 0.0, 3.0);
-                    packed |= uint(q) << (i * 2);
+                for (uint i = 0; i < 8; i++) {
+                    float v = values[grp_off + w * 8 + i];
+                    float q = clamp(round((v - v_min) * inv_sc), 0.0, 15.0);
+                    packed |= uint(q) << (i * 4);
                 }
-                dst_data[out_base + g * 2 + w] = packed;
+                dst_data[out_base + g * 4 + w] = packed;
             }
 
             // Store scale and zero as f16 (packed 2 per uint32)

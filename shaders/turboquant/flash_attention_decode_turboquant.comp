@@ -4,18 +4,18 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// FlashDecoding with TurboQuant MSE-only KV cache.
-// Pre-rotates query via RHT, then scores against 3-bit quantized keys.
-// No QJL — MSE-only gives lower variance after softmax.
+// FlashDecoding with TurboQuant (RHT + 3-bit MSE + 1-bit QJL) KV cache.
+// Pre-rotates query via RHT, scores against 3-bit quantized keys,
+// then adds the QJL residual correction sign(Q_qjl).(1-bit residual signs).
 //
 // Dispatch: (num_heads, 1, 1), one workgroup per attention head.
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 0) buffer readonly Query { float query_data[]; };
 layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
 layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 layout(set = 0, binding = 4) buffer readonly SignFlips { float sign_data[]; };
 
 layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
@@ -54,16 +54,19 @@ void main() {
     uint kv_heads = num_heads / queries_per_kv;
 
     uint mse_words = (head_dim * 3 + 31) / 32;
-    uint key_u32s = 1 + mse_words;
-    uint data_words_v = head_dim / 16;
+    uint qjl_words = head_dim / 32;
+    uint key_u32s = 1 + mse_words + 1 + qjl_words;
+    uint data_words_v = head_dim / 8;
     uint groups_per_head = head_dim / 32;
     uint scale_words_v = (groups_per_head + 1) / 2;
     uint val_u32s = data_words_v + scale_words_v + scale_words_v;
 
-    uint sign_offset = layer_idx * head_dim;
+    uint rht_sign_offset = layer_idx * head_dim * 2;
+    uint qjl_sign_offset = layer_idx * head_dim * 2 + head_dim;
     uint half_dim = head_dim / 2;
+    float rht_scale = 1.0 / sqrt(float(head_dim));
 
-    // ---- Phase 0: Load query, apply RoPE, pre-rotate via RHT ----
+    // ---- Phase 0: Load query, apply RoPE, pre-rotate via RHT, then project via QJL ----
     if (tid < head_dim) {
         q_shared[tid] = float(query_data[head * head_dim + tid]);
     }
@@ -81,7 +84,7 @@ void main() {
     barrier();
 
     // RHT: sign flips + WHT
-    if (tid < head_dim) q_shared[tid] *= sign_data[sign_offset + tid];
+    if (tid < head_dim) q_shared[tid] *= sign_data[rht_sign_offset + tid];
     barrier();
     for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
         if (tid < head_dim && (tid & stride) == 0) {
@@ -92,17 +95,39 @@ void main() {
         }
         barrier();
     }
-    float rht_scale = 1.0 / sqrt(float(head_dim));
     if (tid < head_dim) q_shared[tid] *= rht_scale;
     barrier();
 
-    // Load rotated query into per-lane registers
+    // Load post-RHT query into per-lane registers (used for MSE scoring)
     uint dim_passes = head_dim / 64;
     float rq[4];
     for (uint pass = 0; pass < dim_passes; pass++) {
         uint d0 = pass * 64 + lane * 2;
         rq[pass * 2]     = q_shared[d0];
         rq[pass * 2 + 1] = q_shared[d0 + 1];
+    }
+    barrier();
+
+    // QJL projection of post-RHT query: apply D_qjl signs + WHT + scale
+    if (tid < head_dim) q_shared[tid] *= sign_data[qjl_sign_offset + tid];
+    barrier();
+    for (uint stride = head_dim / 2; stride >= 1; stride >>= 1) {
+        if (tid < head_dim && (tid & stride) == 0) {
+            float a = q_shared[tid];
+            float b = q_shared[tid | stride];
+            q_shared[tid] = a + b;
+            q_shared[tid | stride] = a - b;
+        }
+        barrier();
+    }
+    if (tid < head_dim) q_shared[tid] *= rht_scale;
+    barrier();
+
+    float rq_qjl[4];
+    for (uint pass = 0; pass < dim_passes; pass++) {
+        uint d0 = pass * 64 + lane * 2;
+        rq_qjl[pass * 2]     = q_shared[d0];
+        rq_qjl[pass * 2 + 1] = q_shared[d0 + 1];
     }
     barrier();
 
@@ -116,6 +141,8 @@ void main() {
     uint pos_start = warp_id * warp_chunk;
     uint pos_end = min(pos_start + warp_chunk, count);
 
+    const float QJL_SCALE = 1.2533141 / float(head_dim); // sqrt(pi/2) / d
+
     float m = -1.0 / 0.0;
     float l_val = 0.0;
     float ov[4];
@@ -126,11 +153,15 @@ void main() {
         uint val_base = pos * val_u32_per_pos + val_head_off;
 
         float k_norm = uintBitsToFloat(k_cache[key_base]);
+        float res_norm = uintBitsToFloat(k_cache[key_base + 1 + mse_words]);
 
-        // ---- 3-bit MSE score (direct indexed) ----
+        // ---- 3-bit MSE score + 1-bit QJL residual correction ----
         float mse_local = 0.0;
+        float qjl_local = 0.0;
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint d0 = pass * 64 + lane * 2;
+            uint qjl_word = d0 / 32;
+            uint raw_qjl = k_cache[key_base + 1 + mse_words + 1 + qjl_word];
             for (uint elem = 0; elem < 2; elem++) {
                 uint d = d0 + elem;
                 uint bit_pos = d * 3;
@@ -142,9 +173,13 @@ void main() {
                     idx |= (k_cache[key_base + 1 + word + 1] << (32 - bit)) & 7u;
                 }
                 mse_local += rq[pass * 2 + elem] * cen[idx];
+
+                float qjl_sign = ((raw_qjl >> (d % 32)) & 1u) != 0u ? 1.0 : -1.0;
+                qjl_local += qjl_sign * rq_qjl[pass * 2 + elem];
             }
         }
-        float dot = subgroupAdd(mse_local) * k_norm * scale;
+        float combined_local = mse_local + qjl_local * (QJL_SCALE * res_norm);
+        float dot = subgroupAdd(combined_local) * k_norm * scale;
 
         // Online softmax
         float new_m = max(m, dot);
@@ -152,7 +187,7 @@ void main() {
         float p = exp(dot - new_m);
         l_val = l_val * correction + p;
 
-        // ---- Value dequantize + accumulate ----
+        // ---- Value dequantize + accumulate (4-bit) ----
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint d0 = pass * 64 + lane * 2;
             uint grp = d0 / 32;
@@ -164,10 +199,10 @@ void main() {
             float v_sc = (grp % 2 == 0) ? scales.x : scales.y;
             float v_zero = (grp % 2 == 0) ? zeros.x : zeros.y;
 
-            uint dw0 = val_base + d0 / 16;
+            uint dw0 = val_base + d0 / 8;
             uint raw0 = v_cache[dw0];
-            uint q0 = (raw0 >> ((d0 % 16) * 2)) & 3u;
-            uint q1 = (raw0 >> (((d0 + 1) % 16) * 2)) & 3u;
+            uint q0 = (raw0 >> ((d0 % 8) * 4)) & 0xFu;
+            uint q1 = (raw0 >> (((d0 + 1) % 8) * 4)) & 0xFu;
 
             float v0 = float(q0) * v_sc + v_zero;
             float v1;
@@ -225,8 +260,8 @@ void main() {
         float inv_l = 1.0 / final_l;
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint d0 = pass * 64 + lane * 2;
-            output_data[out_base + d0]     = float16_t(fo[pass * 2]     * inv_l);
-            output_data[out_base + d0 + 1] = float16_t(fo[pass * 2 + 1] * inv_l);
+            output_data[out_base + d0]     = fo[pass * 2]     * inv_l;
+            output_data[out_base + d0 + 1] = fo[pass * 2 + 1] * inv_l;
         }
     }
 }
