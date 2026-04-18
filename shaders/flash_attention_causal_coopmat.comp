@@ -42,12 +42,16 @@ layout(push_constant) uniform PC {
 
 #define BR 16            // queries per WG (one coopmat row tile)
 #define BC 32            // KV positions per inner tile
-#define HSK 128          // head_dim (Q·K inner dim)
-#define HSV 128          // value head_dim
+#ifndef HSK
+#define HSK 128          // head_dim (Q·K inner dim) — override via -DHSK=<n> (must be multiple of 16)
+#endif
+#ifndef HSV
+#define HSV 128          // value head_dim — override via -DHSV=<n> (must be multiple of 16)
+#endif
 #define MAT 16           // coopmat M/N/K
 
-#define QFSTRIDE 136     // HSK + 8 pad f16 elements to avoid bank conflicts (multiple of 8)
-#define KFSTRIDE 136
+#define QFSTRIDE (HSK + 8)  // HSK + 8 pad f16 elements to avoid bank conflicts (multiple of 8)
+#define KFSTRIDE (HSK + 8)
 #define SFSTRIDE (BR + 8)
 #define PFSTRIDE (BR + 8)
 
