@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Fused RoPE + store-as-BF16.
 // RoPE pairs are (i, i+half_dim) but BF16 packing pairs are (2i, 2i+1).
@@ -10,7 +11,7 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Src { float src_data[]; };
+layout(set = 0, binding = 0) buffer readonly Src { float16_t src_data[]; };
 layout(set = 0, binding = 1) buffer readonly CosTable { float cos_table[]; };
 layout(set = 0, binding = 2) buffer readonly SinTable { float sin_table[]; };
 layout(set = 0, binding = 3) buffer Dst { uint dst_data[]; };
@@ -58,8 +59,8 @@ void main() {
 #else
         uint base = head * head_dim;
 #endif
-        float first = src_data[base + i];
-        float second = src_data[base + half_dim + i];
+        float first = float(src_data[base + i]);
+        float second = float(src_data[base + half_dim + i]);
 
         float cos_val = cos_table[position * half_dim + i];
         float sin_val = sin_table[position * half_dim + i];

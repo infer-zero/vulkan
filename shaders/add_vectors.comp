@@ -1,9 +1,10 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer A { float data_a[]; };
-layout(set = 0, binding = 1) buffer readonly B { float data_b[]; };
+layout(set = 0, binding = 0) buffer A { float16_t data_a[]; };
+layout(set = 0, binding = 1) buffer readonly B { float16_t data_b[]; };
 
 layout(push_constant) uniform Params {
     uint count;
@@ -22,8 +23,8 @@ void main() {
     uint offset = idx;
 #endif
 #ifdef RESIDUAL_SCALE
-    data_a[offset] = data_a[offset] * residual_scale + data_b[offset];
+    data_a[offset] = float16_t(float(data_a[offset]) * residual_scale + float(data_b[offset]));
 #else
-    data_a[offset] = data_a[offset] + data_b[offset];
+    data_a[offset] = float16_t(float(data_a[offset]) + float(data_b[offset]));
 #endif
 }

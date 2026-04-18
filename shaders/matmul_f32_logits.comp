@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Warp-per-row tiled GEMV for logits (f32 output for sampling precision).
 // 256 threads = 8 warps of 32. Each warp computes one output row via dot products.
@@ -6,7 +7,7 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { float weight_data[]; };
 layout(set = 0, binding = 2) buffer Output { float output_data[]; };
 
@@ -20,7 +21,8 @@ layout(push_constant) uniform Params {
 #define TILE_K 256
 
 shared float input_tile[TILE_K];   // 1 KB
-shared float reduce[256];           // 1 KB
+shared float reduce[256];          // 1 KB
+                                    // Total: 2 KB
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -33,10 +35,12 @@ void main() {
     bool valid_row = global_row < out_dim;
 
     for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
+        // Cooperatively load 256 input elements into shared memory (coalesced)
         uint load_idx = tile_start + tid;
-        input_tile[tid] = (load_idx < in_dim) ? input_data[load_idx] : 0.0;
+        input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
         barrier();
 
+        // Each warp dots its weight row's tile (32 consecutive elements per step)
         if (valid_row) {
             uint tile_end = min(TILE_K, in_dim - tile_start);
             for (uint j = lane; j < tile_end; j += 32) {
@@ -46,6 +50,7 @@ void main() {
         barrier();
     }
 
+    // Parallel reduction: 32 threads per row -> 1 result
     reduce[tid] = sum;
     barrier();
     if (lane < 16) reduce[tid] += reduce[tid + 16];

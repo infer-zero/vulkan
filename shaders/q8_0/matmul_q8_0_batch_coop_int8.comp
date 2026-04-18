@@ -16,7 +16,7 @@
 // Only shared memory used for scales and writeback scratch.
 //
 // Variants (via preprocessor defines):
-//   (none)       -> full-K loop, writes f32 output directly
+//   (none)       -> full-K loop, writes f16 output directly
 //   KSPLIT_MODE  -> K-split with atomic counter + inline reduce
 
 #define TILE_M 64
@@ -44,9 +44,9 @@ layout(set = 0, binding = 1) buffer readonly Weights { int8_t weight_data[]; };
 
 #ifdef KSPLIT_MODE
 layout(set = 0, binding = 2) buffer coherent PartialAndCounters { uint partial_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
 #else
-layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
 #endif
 
 layout(push_constant) uniform Params {
@@ -183,12 +183,7 @@ void main() {
 
         uint a_row0 = m_base + sg_m_base;
 
-        // M-row 0. Scales stay in f32 here (unlike the panel-matvec shader)
-        // because the coop path matches llama.cpp's Vulkan prefill regime,
-        // which also uses f32 multiplies. Verified empirically: promoting
-        // to f64 in this shader *regressed* 4B tok500_4b_dec100 from 101
-        // MATCH to 41 (first MISS at step 12) against llama.cpp — the tighter
-        // rounding crossed tie boundaries and diverged trajectories earlier.
+        // M-row 0
         coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
         s32_result = coopMatMulAdd(a_i8, b0_i8, s32_zero);
         for (uint e = 0; e < elem_count; e++)
@@ -240,7 +235,7 @@ void main() {
             uint gm = out_m + m_off + i / 16;                                               \
             uint gn = out_n + n_off + i % 16;                                               \
             if (gm < batch_size && gn < out_dim)                                             \
-                output_data[gm * out_dim + gn] = scratch[sb + i];                            \
+                output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);                 \
         }
 #endif
 
@@ -275,7 +270,7 @@ void main() {
                 for (uint kg = 0; kg < num_k_groups; kg++) {
                     final_sum += uintBitsToFloat(partial_data[(kg * batch_size + gm) * out_dim + gn]);
                 }
-                output_data[gm * out_dim + gn] = final_sum;
+                output_data[gm * out_dim + gn] = float16_t(final_sum);
             }
         }
 

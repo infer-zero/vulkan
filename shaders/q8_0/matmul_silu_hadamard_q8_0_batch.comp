@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_control_flow_attributes : require
 #ifdef IDP_MODE
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -11,7 +12,7 @@
 // output[M,N] = SiLU(gate[M,N]) * up[M,N]
 //
 // Variants (via preprocessor defines):
-//   (none)     -> A is f32 activations, dequant weights to float, outer-product accumulation
+//   (none)     -> A is f16 activations, dequant weights to float, outer-product accumulation
 //   IDP_MODE   -> A is pre-quantized (packed int8 + scale), weights stay packed, dotPacked4x8EXT
 
 #define TILE_M 64
@@ -34,11 +35,11 @@ layout(local_size_x = 256) in;
 #ifdef IDP_MODE
 layout(set = 0, binding = 0) buffer readonly QuantInput { uint quant_data[]; };
 #else
-layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
 #endif
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -136,7 +137,7 @@ void main() {
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? input_data[gm * in_dim + k_base + k] : 0.0;
+                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
         }
 
         // Load Gate and Up tiles: vectorized uint reads
@@ -228,7 +229,7 @@ void main() {
             if (gn < out_dim) {
                 float gate = gate_acc[i * THREAD_N + j];
                 float silu = gate / (1.0 + exp(-gate));
-                output_data[gm * out_dim + gn] = silu * up_acc[i * THREAD_N + j];
+                output_data[gm * out_dim + gn] = float16_t(silu * up_acc[i * THREAD_N + j]);
             }
         }
     }

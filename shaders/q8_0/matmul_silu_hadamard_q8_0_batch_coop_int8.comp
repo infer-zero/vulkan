@@ -37,7 +37,7 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer readonly Input { int8_t input_data[]; };   // Q8_0 quantized activations
 layout(set = 0, binding = 1) buffer readonly GateWeights { int8_t gate_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { int8_t up_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -163,9 +163,7 @@ void main() {
 
         uint a_row0 = m_base + sg_m_base;
 
-        // M-row 0. Scales in f32; see matmul_q8_0_batch_coop_int8.comp for
-        // the note on why the coop path stays f32 (matches llama.cpp Vulkan
-        // prefill regime; f64 promotion crossed tie boundaries empirically).
+        // M-row 0
         coopMatLoad(a_i8, input_data, (a_row0 + 0) * input_row_stride + block_idx * A_BLOCK_SIZE + 4, input_row_stride, gl_CooperativeMatrixLayoutRowMajor);
 
         s32_result = coopMatMulAdd(a_i8, gb0_i8, s32_zero);
@@ -221,7 +219,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
         }
     }
 
@@ -238,7 +236,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
         }
     }
 
@@ -255,7 +253,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
         }
     }
 
@@ -272,7 +270,7 @@ void main() {
         if (gm < batch_size && gn < out_dim) {
             float gate = gate_cache[i];
             float silu = gate / (1.0 + exp(-gate));
-            output_data[gm * out_dim + gn] = silu * scratch[sb + idx];
+            output_data[gm * out_dim + gn] = float16_t(silu * scratch[sb + idx]);
         }
     }
 }
