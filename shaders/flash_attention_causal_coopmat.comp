@@ -1,0 +1,245 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// KHR cooperative-matrix prefill flash attention, modeled after llama.cpp's
+// `flash_attn_cm1.comp`. Uses fp16 tensor cores for Q·Kᵀ and P·V.
+//
+// One workgroup = 1 subgroup (32 threads) = one Q head × BR consecutive
+// query tokens. Bc KV positions processed per inner tile. Accumulators in
+// f32 for Q·Kᵀ and f16 for P·V (matches llama.cpp; softmax bounds keep P·V
+// in f16 range).
+//
+// Supports head_dim=128 only (asserted at dispatch). KV cache is packed BF16
+// or F16 (KV_CACHE_F16 selects), 2 values per uint32.
+//
+// Dispatch: grid=(ceil(batch_size/BR), num_heads, 1), workgroup_size=(32,1,1).
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) buffer readonly Query { float query_data[]; };
+layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
+layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint kv_dim;
+    uint num_heads;
+    uint queries_per_kv;
+    uint start_position;
+    uint batch_size;
+    float scale;
+    uint capacity;
+    float rope_theta;
+};
+
+#define BR 16            // queries per WG (one coopmat row tile)
+#define BC 32            // KV positions per inner tile
+#define HSK 128          // head_dim (Q·K inner dim)
+#define HSV 128          // value head_dim
+#define MAT 16           // coopmat M/N/K
+
+#define QFSTRIDE 136     // HSK + 8 pad f16 elements to avoid bank conflicts (multiple of 8)
+#define KFSTRIDE 136
+#define SFSTRIDE (BR + 8)
+#define PFSTRIDE (BR + 8)
+
+// Coopmat aliases: fp16 A, fp16 B, f32 Acc for S = K·Qᵀ; f16 A/B/Acc for P·V.
+#define mat_a_f16 coopmat<float16_t, gl_ScopeSubgroup, MAT, MAT, gl_MatrixUseA>
+#define mat_b_f16 coopmat<float16_t, gl_ScopeSubgroup, MAT, MAT, gl_MatrixUseB>
+#define mat_s_f32 coopmat<float,     gl_ScopeSubgroup, MAT, MAT, gl_MatrixUseAccumulator>
+#define mat_p_f16 coopmat<float16_t, gl_ScopeSubgroup, MAT, MAT, gl_MatrixUseAccumulator>
+
+// --- Shared memory ---
+// Qf: BR × HSK as f16, padded to QFSTRIDE.
+// Kf: BC × HSK as f16, padded to KFSTRIDE.
+// Vf: BC × HSK as f16, padded to KFSTRIDE.
+// Sf: BC × BR as f32 (output of Q·Kᵀ step).
+// Pf: BC × BR as f16 (softmax output, input to P·V).
+// Ov: BR × HSV as f16 running accumulator (rescaled every tile).
+shared float16_t Qf[BR * QFSTRIDE];
+shared float16_t Kf[BC * KFSTRIDE];
+shared float16_t Vf[BC * KFSTRIDE];
+shared float      Sf[BC * SFSTRIDE];
+shared float16_t  Pf[BC * PFSTRIDE];
+shared float16_t  Of[BR * HSV];  // running output accumulator in shared memory
+
+void unpackKVPair(uint packed, out float v0, out float v1) {
+#ifdef KV_CACHE_F16
+    vec2 v = unpackHalf2x16(packed);
+    v0 = v.x;
+    v1 = v.y;
+#else
+    v0 = uintBitsToFloat((packed & 0xFFFFu) << 16);
+    v1 = uintBitsToFloat(packed & 0xFFFF0000u);
+#endif
+}
+
+void main() {
+    uint tid   = gl_LocalInvocationID.x;
+    uint tile  = gl_WorkGroupID.x;     // query tile index along batch axis
+    uint head  = gl_WorkGroupID.y;     // which Q head
+    uint lane  = tid;                  // 0..31 (one subgroup/WG)
+
+    uint q_tile_base = tile * BR;
+    uint kv_head     = head / queries_per_kv;
+
+    // ── Load Qf (BR × HSK) from global query buffer, scaled by p.scale ──
+    // 16 rows × 128 cols = 2048 f16 values. 32 lanes → 64 values/lane = 16 vec4s.
+    [[unroll]] for (uint i = 0; i < BR * HSK; i += 32) {
+        uint idx = i + lane;
+        uint row = idx / HSK;
+        uint col = idx % HSK;
+        uint q_idx = q_tile_base + row;
+        float v = 0.0;
+        if (q_idx < batch_size) {
+            v = query_data[q_idx * num_heads * HSK + head * HSK + col] * scale;
+        }
+        Qf[row * QFSTRIDE + col] = float16_t(v);
+    }
+
+    // ── Per-query-row softmax state in shared memory (f32). ──
+    // BR rows; use first BR lanes. Also reset Of[][].
+    if (lane < BR) {
+        // one-of-two running values per row; we keep these in lane-scoped
+        // registers below and reload from Sf / regs, so no shared state
+        // needed here. Just zero Of.
+    }
+    for (uint i = lane; i < BR * HSV; i += 32) {
+        Of[i] = float16_t(0.0);
+    }
+
+    // Per-thread per-row softmax state. Thread `lane` owns row = lane when lane<BR,
+    // otherwise irrelevant (but still participates in coopmat ops).
+    float m_row = -1.0e30;
+    float l_row = 0.0;
+    bool  owns_row = lane < BR;
+    uint  my_row   = lane;                         // valid only if owns_row
+
+    uint max_count = min(start_position + q_tile_base + BR, start_position + batch_size);
+
+    uint packed_head = HSK / 2;            // 64 packed uint32s per KV vector
+    uint packed_kv_stride = kv_dim / 2;
+    uint packed_kv_base   = (kv_head * HSK) / 2;
+
+    barrier();
+
+    // ── Inner loop over KV tiles ──
+    for (uint tile_start = 0; tile_start < max_count; tile_start += BC) {
+        uint tile_end = min(tile_start + BC, max_count);
+        uint tile_len = tile_end - tile_start;
+
+        // Load K and V tiles (BC rows × HSK cols of f16). 32 lanes load
+        // BC*packed_head = 32*64 = 2048 uint32 per buffer → 64/lane.
+        [[unroll]] for (uint i = 0; i < BC * packed_head; i += 32) {
+            uint idx  = i + lane;
+            uint row  = idx / packed_head;
+            uint pair = idx % packed_head;
+            uint pos  = tile_start + row;
+            if (pos < tile_end) {
+                uint packed_off = pos * packed_kv_stride + packed_kv_base;
+                float k0, k1, v0, v1;
+                unpackKVPair(k_cache[packed_off + pair], k0, k1);
+                unpackKVPair(v_cache[packed_off + pair], v0, v1);
+                uint col = pair * 2;
+                Kf[row * KFSTRIDE + col]     = float16_t(k0);
+                Kf[row * KFSTRIDE + col + 1] = float16_t(k1);
+                Vf[row * KFSTRIDE + col]     = float16_t(v0);
+                Vf[row * KFSTRIDE + col + 1] = float16_t(v1);
+            } else {
+                // Zero-fill so S-row beyond tile_len evaluates to 0 then -inf mask.
+                uint col = pair * 2;
+                Kf[row * KFSTRIDE + col]     = float16_t(0.0);
+                Kf[row * KFSTRIDE + col + 1] = float16_t(0.0);
+                Vf[row * KFSTRIDE + col]     = float16_t(0.0);
+                Vf[row * KFSTRIDE + col + 1] = float16_t(0.0);
+            }
+        }
+        subgroupMemoryBarrierShared();
+
+        // ── S = K · Qᵀ, shape BC × BR ──
+        // BC=32 splits into 2 vertical 16-row slabs. Reduce over HSK in chunks of MAT=16.
+        [[unroll]] for (uint sb = 0; sb < BC / MAT; sb++) {
+            mat_s_f32 S = mat_s_f32(0.0);
+            [[unroll]] for (uint kc = 0; kc < HSK / MAT; kc++) {
+                mat_a_f16 K_tile;
+                mat_b_f16 Q_tile;
+                coopMatLoad(K_tile, Kf, sb * MAT * KFSTRIDE + kc * MAT, KFSTRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                // Q is loaded in "ColumnMajor" so that B-matrix holds Qᵀ.
+                coopMatLoad(Q_tile, Qf, kc * MAT,            QFSTRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                S = coopMatMulAdd(K_tile, Q_tile, S);
+            }
+            coopMatStore(S, Sf, sb * MAT * SFSTRIDE, SFSTRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+
+        // ── Causal mask + per-row softmax update ──
+        // Lane `r < BR` owns row r; reads Sf[row=c, col=r] (S is Bc × Br with col=r).
+        if (owns_row) {
+            uint q_abs = start_position + q_tile_base + my_row;
+            float row_max = -1.0e30;
+            [[unroll]] for (uint c = 0; c < BC; c++) {
+                uint kv_pos = tile_start + c;
+                float s = (kv_pos <= q_abs && c < tile_len) ? Sf[c * SFSTRIDE + my_row] : -1.0e30;
+                Sf[c * SFSTRIDE + my_row] = s;          // rewrite with mask applied
+                row_max = max(row_max, s);
+            }
+            float new_m = max(m_row, row_max);
+            float corr  = exp(m_row - new_m);
+            float row_sum = 0.0;
+            [[unroll]] for (uint c = 0; c < BC; c++) {
+                float p = exp(Sf[c * SFSTRIDE + my_row] - new_m);
+                Pf[c * PFSTRIDE + my_row] = float16_t(p);
+                row_sum += p;
+            }
+            l_row = l_row * corr + row_sum;
+            m_row = new_m;
+            // Rescale Of row by correction (stored in shared, one row of HSV f16).
+            float16_t corr_h = float16_t(corr);
+            [[unroll]] for (uint d = 0; d < HSV; d++) {
+                Of[my_row * HSV + d] *= corr_h;
+            }
+        }
+        subgroupMemoryBarrierShared();
+
+        // ── Of += P · V, shape BR × HSV ──
+        // P (A-matrix) shape [BR][BC] is stored as Pf[c][r] = Pf[c*PFSTRIDE+r];
+        // loading ColumnMajor with stride PFSTRIDE and offset k*PFSTRIDE gives us
+        // A[m][k] = Pf[k*PFSTRIDE + m] = P[m][k].
+        [[unroll]] for (uint ds = 0; ds < HSV / MAT; ds++) {
+            mat_p_f16 PV = mat_p_f16(0.0);
+            [[unroll]] for (uint sb = 0; sb < BC / MAT; sb++) {
+                mat_a_f16 P_tile;
+                mat_b_f16 V_tile;
+                coopMatLoad(P_tile, Pf, sb * MAT * PFSTRIDE,             PFSTRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(V_tile, Vf, sb * MAT * KFSTRIDE + ds * MAT, KFSTRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                PV = coopMatMulAdd(P_tile, V_tile, PV);
+            }
+            // Accumulate into Of[:, ds*MAT:(ds+1)*MAT] via coopmat load/add/store.
+            mat_p_f16 Oprev;
+            coopMatLoad(Oprev, Of, ds * MAT, HSV, gl_CooperativeMatrixLayoutRowMajor);
+            PV = PV + Oprev;
+            coopMatStore(PV, Of, ds * MAT, HSV, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+    }
+
+    // ── Normalize and write output in f32 ──
+    if (owns_row) {
+        float inv_l = (l_row > 0.0) ? (1.0 / l_row) : 0.0;
+        uint q_idx = q_tile_base + my_row;
+        if (q_idx < batch_size) {
+            uint out_base = q_idx * num_heads * HSV + head * HSV;
+            [[unroll]] for (uint d = 0; d < HSV; d++) {
+                output_data[out_base + d] = float(Of[my_row * HSV + d]) * inv_l;
+            }
+        }
+    }
+}
