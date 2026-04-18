@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -20,13 +19,13 @@
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
 #ifdef STORE_BF16_KV
 layout(set = 0, binding = 2) buffer KVCache { uint kv_cache[]; };
 layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
 #else
-layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
 #endif
 
 layout(push_constant) uniform Params {
@@ -66,17 +65,21 @@ void main() {
 
     // Each thread handles 8 consecutive elements per iteration.
     // 128 threads × 8 = 1024 elements per iter = 4 super-blocks.
-    uint input_base = tid * 4u;
+    uint input_base = tid * 8u;
 
     for (uint col = tid * 8u; col < in_dim; col += 1024u) {
-        // Read 8 input f16 values
-        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
-        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1u]);
-        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2u]);
-        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3u]);
-        input_base += 512u;
+        // Read 8 input f32 values
+        float i0 = input_data[input_base + 0u];
+        float i1 = input_data[input_base + 1u];
+        float i2 = input_data[input_base + 2u];
+        float i3 = input_data[input_base + 3u];
+        float i4 = input_data[input_base + 4u];
+        float i5 = input_data[input_base + 5u];
+        float i6 = input_data[input_base + 6u];
+        float i7 = input_data[input_base + 7u];
+        input_base += 1024u;
 
-        float input_sum = b01.x + b01.y + b23.x + b23.y + b45.x + b45.y + b67.x + b67.y;
+        float input_sum = i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7;
 
         // Position within 256-element super-block
         uint sb_idx = col / 256u;
@@ -144,14 +147,14 @@ void main() {
 
             // 5-bit dequant: (nibble | (qh << 4)), factored as d_sc * val5_sum - dmin_mn * input_sum
             float val5_dot =
-                b01.x * float(((w0 >> nibble_shift) & 0xFu)         | (qh0 << 4u)) +
-                b01.y * float(((w0 >> (8u + nibble_shift)) & 0xFu)  | (qh1 << 4u)) +
-                b23.x * float(((w0 >> (16u + nibble_shift)) & 0xFu) | (qh2 << 4u)) +
-                b23.y * float(((w0 >> (24u + nibble_shift)) & 0xFu) | (qh3 << 4u)) +
-                b45.x * float(((w1 >> nibble_shift) & 0xFu)         | (qh4 << 4u)) +
-                b45.y * float(((w1 >> (8u + nibble_shift)) & 0xFu)  | (qh5 << 4u)) +
-                b67.x * float(((w1 >> (16u + nibble_shift)) & 0xFu) | (qh6 << 4u)) +
-                b67.y * float(((w1 >> (24u + nibble_shift)) & 0xFu) | (qh7 << 4u));
+                i0 * float(((w0 >> nibble_shift) & 0xFu)         | (qh0 << 4u)) +
+                i1 * float(((w0 >> (8u + nibble_shift)) & 0xFu)  | (qh1 << 4u)) +
+                i2 * float(((w0 >> (16u + nibble_shift)) & 0xFu) | (qh2 << 4u)) +
+                i3 * float(((w0 >> (24u + nibble_shift)) & 0xFu) | (qh3 << 4u)) +
+                i4 * float(((w1 >> nibble_shift) & 0xFu)         | (qh4 << 4u)) +
+                i5 * float(((w1 >> (8u + nibble_shift)) & 0xFu)  | (qh5 << 4u)) +
+                i6 * float(((w1 >> (16u + nibble_shift)) & 0xFu) | (qh6 << 4u)) +
+                i7 * float(((w1 >> (24u + nibble_shift)) & 0xFu) | (qh7 << 4u));
 
             temp[n] += d_sc * val5_dot - dmin_mn * input_sum;
         }
@@ -186,7 +189,7 @@ void main() {
             uint row = first_row + n;
             if (row < out_dim) {
                 float result = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
-                output_data[row] = float16_t(result);
+                output_data[row] = result;
             }
         }
 #endif

@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_control_flow_attributes : enable
 
 // Tiled GEMM: C[M,N] = A[M,K] x B^T[N,K]
@@ -32,9 +31,9 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -76,7 +75,7 @@ void main() {
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? float(input_data[gm * in_dim + k_base + k]) : 0.0;
+                ? input_data[gm * in_dim + k_base + k] : 0.0;
         }
 
         // Load B tile: 128 threads each dequantize one Q5_0 block (32 values from 22 bytes)
@@ -146,7 +145,7 @@ void main() {
         [[unroll]] for (uint j = 0; j < THREAD_N; j++) {
             uint gn = n_base + thread_n * THREAD_N + j;
             if (gn < out_dim) {
-                output_data[gm * out_dim + gn] = float16_t(acc[i * THREAD_N + j]);
+                output_data[gm * out_dim + gn] = acc[i * THREAD_N + j];
             }
         }
     }

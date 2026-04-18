@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : enable
 
@@ -17,10 +16,10 @@
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_weight_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_weight_data[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -79,17 +78,21 @@ void main() {
         up_temp[n] = 0.0;
     }
 
-    uint input_base = tid * 4;
+    uint input_base = tid * 8;
     uint block_idx = (tid * 8) / 32;
 
     uint elem_start = sub_byte_offset;
 
     for (uint col = tid * 8; col < in_dim; col += 1024) {
-        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
-        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
-        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
-        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
-        input_base += 512;
+        float i0 = input_data[input_base + 0];
+        float i1 = input_data[input_base + 1];
+        float i2 = input_data[input_base + 2];
+        float i3 = input_data[input_base + 3];
+        float i4 = input_data[input_base + 4];
+        float i5 = input_data[input_base + 5];
+        float i6 = input_data[input_base + 6];
+        float i7 = input_data[input_base + 7];
+        input_base += 1024;
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
@@ -108,14 +111,14 @@ void main() {
             uint g_qh_shifted = g_qh >> (qh_bit_base + elem_start);
 
             float g_dot =
-                b01.x * float(int(((gw0 >> nibble_shift) & 0xFu) | (((g_qh_shifted      ) & 1u) << 4u)) - 16) +
-                b01.y * float(int(((gw0 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 1u) & 1u) << 4u)) - 16) +
-                b23.x * float(int(((gw0 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 2u) & 1u) << 4u)) - 16) +
-                b23.y * float(int(((gw0 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 3u) & 1u) << 4u)) - 16) +
-                b45.x * float(int(((gw1 >> nibble_shift) & 0xFu) | (((g_qh_shifted >> 4u) & 1u) << 4u)) - 16) +
-                b45.y * float(int(((gw1 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 5u) & 1u) << 4u)) - 16) +
-                b67.x * float(int(((gw1 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 6u) & 1u) << 4u)) - 16) +
-                b67.y * float(int(((gw1 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 7u) & 1u) << 4u)) - 16);
+                i0 * float(int(((gw0 >> nibble_shift) & 0xFu) | (((g_qh_shifted      ) & 1u) << 4u)) - 16) +
+                i1 * float(int(((gw0 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 1u) & 1u) << 4u)) - 16) +
+                i2 * float(int(((gw0 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 2u) & 1u) << 4u)) - 16) +
+                i3 * float(int(((gw0 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 3u) & 1u) << 4u)) - 16) +
+                i4 * float(int(((gw1 >> nibble_shift) & 0xFu) | (((g_qh_shifted >> 4u) & 1u) << 4u)) - 16) +
+                i5 * float(int(((gw1 >> (8u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 5u) & 1u) << 4u)) - 16) +
+                i6 * float(int(((gw1 >> (16u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 6u) & 1u) << 4u)) - 16) +
+                i7 * float(int(((gw1 >> (24u + nibble_shift)) & 0xFu) | (((g_qh_shifted >> 7u) & 1u) << 4u)) - 16);
 
             gate_temp[n] += g_scale * g_dot;
 
@@ -128,14 +131,14 @@ void main() {
             uint u_qh_shifted = u_qh >> (qh_bit_base + elem_start);
 
             float u_dot =
-                b01.x * float(int(((uw0 >> nibble_shift) & 0xFu) | (((u_qh_shifted      ) & 1u) << 4u)) - 16) +
-                b01.y * float(int(((uw0 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 1u) & 1u) << 4u)) - 16) +
-                b23.x * float(int(((uw0 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 2u) & 1u) << 4u)) - 16) +
-                b23.y * float(int(((uw0 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 3u) & 1u) << 4u)) - 16) +
-                b45.x * float(int(((uw1 >> nibble_shift) & 0xFu) | (((u_qh_shifted >> 4u) & 1u) << 4u)) - 16) +
-                b45.y * float(int(((uw1 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 5u) & 1u) << 4u)) - 16) +
-                b67.x * float(int(((uw1 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 6u) & 1u) << 4u)) - 16) +
-                b67.y * float(int(((uw1 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 7u) & 1u) << 4u)) - 16);
+                i0 * float(int(((uw0 >> nibble_shift) & 0xFu) | (((u_qh_shifted      ) & 1u) << 4u)) - 16) +
+                i1 * float(int(((uw0 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 1u) & 1u) << 4u)) - 16) +
+                i2 * float(int(((uw0 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 2u) & 1u) << 4u)) - 16) +
+                i3 * float(int(((uw0 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 3u) & 1u) << 4u)) - 16) +
+                i4 * float(int(((uw1 >> nibble_shift) & 0xFu) | (((u_qh_shifted >> 4u) & 1u) << 4u)) - 16) +
+                i5 * float(int(((uw1 >> (8u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 5u) & 1u) << 4u)) - 16) +
+                i6 * float(int(((uw1 >> (16u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 6u) & 1u) << 4u)) - 16) +
+                i7 * float(int(((uw1 >> (24u + nibble_shift)) & 0xFu) | (((u_qh_shifted >> 7u) & 1u) << 4u)) - 16);
 
             up_temp[n] += u_scale * u_dot;
         }
@@ -163,7 +166,7 @@ void main() {
                 float g = gate_sh[n][0] + gate_sh[n][1] + gate_sh[n][2] + gate_sh[n][3];
                 float u = up_sh[n][0] + up_sh[n][1] + up_sh[n][2] + up_sh[n][3];
                 float silu_g = g / (1.0 + exp(-g));
-                output_data[row] = float16_t(silu_g * u);
+                output_data[row] = silu_g * u;
             }
         }
     }

@@ -9,10 +9,10 @@
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly GateWeights { uint gate_weight_data[]; };
 layout(set = 0, binding = 2) buffer readonly UpWeights { uint up_weight_data[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -56,25 +56,29 @@ void main() {
         up_temp[n] = 0.0;
     }
 
-    uint input_base = tid * 4;
+    uint input_base = tid * 8;
 
     for (uint col = tid * 8; col < in_dim; col += 1024) {
-        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
-        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
-        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
-        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
-        input_base += 512;
+        float b0 = input_data[input_base + 0];
+        float b1 = input_data[input_base + 1];
+        float b2 = input_data[input_base + 2];
+        float b3 = input_data[input_base + 3];
+        float b4 = input_data[input_base + 4];
+        float b5 = input_data[input_base + 5];
+        float b6 = input_data[input_base + 6];
+        float b7 = input_data[input_base + 7];
+        input_base += 1024;
 
         // On-the-fly quantization to int8
-        float amax = max(max(max(abs(b01.x), abs(b01.y)), max(abs(b23.x), abs(b23.y))),
-                        max(max(abs(b45.x), abs(b45.y)), max(abs(b67.x), abs(b67.y))));
+        float amax = max(max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3))),
+                        max(max(abs(b4), abs(b5)), max(abs(b6), abs(b7))));
         float a_scale = amax / 127.0;
         float inv_scale = (amax > 0.0) ? 127.0 / amax : 0.0;
 
-        int ai0 = int(round(b01.x * inv_scale)); int ai1 = int(round(b01.y * inv_scale));
-        int ai2 = int(round(b23.x * inv_scale)); int ai3 = int(round(b23.y * inv_scale));
-        int ai4 = int(round(b45.x * inv_scale)); int ai5 = int(round(b45.y * inv_scale));
-        int ai6 = int(round(b67.x * inv_scale)); int ai7 = int(round(b67.y * inv_scale));
+        int ai0 = int(round(b0 * inv_scale)); int ai1 = int(round(b1 * inv_scale));
+        int ai2 = int(round(b2 * inv_scale)); int ai3 = int(round(b3 * inv_scale));
+        int ai4 = int(round(b4 * inv_scale)); int ai5 = int(round(b5 * inv_scale));
+        int ai6 = int(round(b6 * inv_scale)); int ai7 = int(round(b7 * inv_scale));
 
         uint a_pack0 = (uint(ai0) & 0xFFu) | ((uint(ai1) & 0xFFu) << 8u) |
                        ((uint(ai2) & 0xFFu) << 16u) | ((uint(ai3) & 0xFFu) << 24u);
@@ -166,7 +170,7 @@ void main() {
                 float g = gate_sh[n][0] + gate_sh[n][1] + gate_sh[n][2] + gate_sh[n][3];
                 float u = up_sh[n][0] + up_sh[n][1] + up_sh[n][2] + up_sh[n][3];
                 float silu_g = g / (1.0 + exp(-g));
-                output_data[row] = float16_t(silu_g * u);
+                output_data[row] = silu_g * u;
             }
         }
     }
