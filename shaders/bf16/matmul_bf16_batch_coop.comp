@@ -28,9 +28,9 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -84,7 +84,7 @@ void main() {
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? input_data[gm * in_dim + k_base + k]
+                ? float16_t(input_data[gm * in_dim + k_base + k])
                 : float16_t(0.0);
         }
 
@@ -150,7 +150,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 1: acc01 -> rows +0, cols +16
@@ -160,7 +160,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 2: acc10 -> rows +16, cols +0
@@ -170,7 +170,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 3: acc11 -> rows +16, cols +16
@@ -180,7 +180,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 4: acc20 -> rows +32, cols +0
@@ -190,7 +190,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 5: acc21 -> rows +32, cols +16
@@ -200,7 +200,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 6: acc30 -> rows +48, cols +0
@@ -210,7 +210,7 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 
     // Tile 7: acc31 -> rows +48, cols +16
@@ -220,6 +220,6 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = scratch[sb + i];
     }
 }
