@@ -1,26 +1,43 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// Panel-interleaved Q8_0 matvec: 128 threads (4 subgroups), 2 rows per WG.
+// Panel-interleaved Q8_0 matvec: 128 threads (4 subgroups), NUM_ROWS per WG.
+// Widening NUM_ROWS amortizes the per-WG activation read + in-shader quantization
+// across more output rows, cutting activation re-reads per token. Keep NUM_ROWS a
+// divisor of PANEL_N=128 so each WG fits inside one panel.
 // Weight buffer layout (panel-interleaved, PANEL_N=128):
 //   Per panel: [f16 scales: num_blocks * PANEL_N * 2B][i8 data: num_blocks * PANEL_N * 32B]
 // Accessed via uint weight_data[].
 //
+// Activations are quantized to Q8_0 per-block (matching llama.cpp's
+// `quantize_row_q8_0`): each 32-element block gets one f32 scale and 32 i8s.
+// When the input has a spike (e.g. after an ffn_norm with a large weight
+// column), the block scale is set by the spike and the small values round
+// to zero. This *loses* precision vs. the f32-input dot, but produces the
+// exact same result as llama.cpp / our CPU — which matters because the
+// model was calibrated against that quant behaviour and diverges over
+// hundreds of decoded tokens if we're too accurate.
+//
 // Variants:
-//   (none)         -> f16 output (3buf: input, weights, output)
+//   (none)         -> f32 output (3buf: input, weights, output)
 //   STORE_BF16_KV  -> BF16 KV cache write (3buf + dyn: input, weights, kv_cache + dynamic)
+//   STORE_F16_KV   -> F16 KV cache write (same bindings as STORE_BF16_KV)
+
+#if defined(STORE_BF16_KV) || defined(STORE_F16_KV)
+#define STORE_KV
+#endif
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { uint input_packed[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-#ifdef STORE_BF16_KV
+#ifdef STORE_KV
 layout(set = 0, binding = 2) buffer KVCache { uint kv_cache[]; };
 layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
 #else
-layout(set = 0, binding = 2) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
 #endif
 
 layout(push_constant) uniform Params {
@@ -28,11 +45,14 @@ layout(push_constant) uniform Params {
     uint out_dim;
 };
 
+#ifndef NUM_ROWS
 #define NUM_ROWS 2
+#endif
 #define PANEL_N 128
 #define Q8_BLOCK_SIZE 34
 
-shared float tmpsh[NUM_ROWS][4];  // 2 x 4 = 32 B
+// Per-subgroup partials (4 subgroups of 32) → thread 0 reduces 4 values.
+shared float tmpsh[NUM_ROWS][4];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -67,16 +87,38 @@ void main() {
     float temp[NUM_ROWS];
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
 
-    uint input_base = tid * 4; // col/2 for packed uint32 input
+    uint input_base = tid * 8; // 8 f32 values per thread
     uint block_idx = (tid * 8) / 32;
 
     for (uint col = tid * 8; col < in_dim; col += 1024) {
-        // Read 8 input f16 values as 4 packed uint32
-        vec2 b01 = unpackHalf2x16(input_packed[input_base]);
-        vec2 b23 = unpackHalf2x16(input_packed[input_base + 1]);
-        vec2 b45 = unpackHalf2x16(input_packed[input_base + 2]);
-        vec2 b67 = unpackHalf2x16(input_packed[input_base + 3]);
-        input_base += 512; // 1024 / 2
+        // Read 8 input f32 values
+        float b0 = input_data[input_base + 0];
+        float b1 = input_data[input_base + 1];
+        float b2 = input_data[input_base + 2];
+        float b3 = input_data[input_base + 3];
+        float b4 = input_data[input_base + 4];
+        float b5 = input_data[input_base + 5];
+        float b6 = input_data[input_base + 6];
+        float b7 = input_data[input_base + 7];
+        input_base += 1024;
+
+        // Per-block Q8_0 quantization of input. 4 consecutive threads share a
+        // 32-element block (tid&3); find max over those 32 elements using two
+        // XOR-shuffle reductions, then quantize to i8-equivalent floats.
+        float local_max = max(max(max(abs(b0), abs(b1)), max(abs(b2), abs(b3))),
+                              max(max(abs(b4), abs(b5)), max(abs(b6), abs(b7))));
+        local_max = max(local_max, subgroupShuffleXor(local_max, 1));
+        local_max = max(local_max, subgroupShuffleXor(local_max, 2));
+        float input_scale = local_max / 127.0;
+        float inv_input_scale = (local_max > 0.0) ? (127.0 / local_max) : 0.0;
+        float q0 = round(b0 * inv_input_scale);
+        float q1 = round(b1 * inv_input_scale);
+        float q2 = round(b2 * inv_input_scale);
+        float q3 = round(b3 * inv_input_scale);
+        float q4 = round(b4 * inv_input_scale);
+        float q5 = round(b5 * inv_input_scale);
+        float q6 = round(b6 * inv_input_scale);
+        float q7 = round(b7 * inv_input_scale);
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
@@ -84,7 +126,7 @@ void main() {
 
             // Scale: read from scale section
             uint si = panel_base_u32[n] + scale_off_u32[n] + block_idx * scale_stride_u32;
-            float scale = unpackHalf2x16((weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
+            float weight_scale = unpackHalf2x16((weight_data[si] >> scale_shift[n]) & 0xFFFFu).x;
 
             // Data: 2 consecutive uint32 (8 bytes)
             uint di = data_base_u32[n] + block_idx * data_stride_u32;
@@ -92,51 +134,65 @@ void main() {
             uint w1 = weight_data[di + 1];
 
             float dot_sum =
-                b01.x * float(bitfieldExtract(int(w0), 0, 8)) +
-                b01.y * float(bitfieldExtract(int(w0), 8, 8)) +
-                b23.x * float(bitfieldExtract(int(w0), 16, 8)) +
-                b23.y * float(bitfieldExtract(int(w0), 24, 8)) +
-                b45.x * float(bitfieldExtract(int(w1), 0, 8)) +
-                b45.y * float(bitfieldExtract(int(w1), 8, 8)) +
-                b67.x * float(bitfieldExtract(int(w1), 16, 8)) +
-                b67.y * float(bitfieldExtract(int(w1), 24, 8));
+                q0 * float(bitfieldExtract(int(w0), 0, 8)) +
+                q1 * float(bitfieldExtract(int(w0), 8, 8)) +
+                q2 * float(bitfieldExtract(int(w0), 16, 8)) +
+                q3 * float(bitfieldExtract(int(w0), 24, 8)) +
+                q4 * float(bitfieldExtract(int(w1), 0, 8)) +
+                q5 * float(bitfieldExtract(int(w1), 8, 8)) +
+                q6 * float(bitfieldExtract(int(w1), 16, 8)) +
+                q7 * float(bitfieldExtract(int(w1), 24, 8));
 
-            temp[n] += scale * dot_sum;
+            temp[n] += input_scale * weight_scale * dot_sum;
         }
         block_idx += 32; // 1024 / 32
     }
 
-    // Reduce: subgroupAdd within each subgroup
+    // Reduce: subgroupAdd within each of 4 subgroups, then thread 0 sums
+    // the 4 subgroup partials via shared memory.
+    uint sg_id = tid / 32;
+    uint sg_lane = tid & 31;
     [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-        temp[n] = subgroupAdd(temp[n]);
-    }
-
-    // Cross-subgroup reduction via shared memory
-    if (gl_SubgroupInvocationID == 0) {
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            tmpsh[n][gl_SubgroupID] = temp[n];
-        }
+        float sg_sum = subgroupAdd(temp[n]);
+        if (sg_lane == 0) tmpsh[n][sg_id] = sg_sum;
     }
     barrier();
 
     if (tid == 0) {
-#ifdef STORE_BF16_KV
+        float row_sum[NUM_ROWS];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            row_sum[n] = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
+        }
+
+#ifdef STORE_KV
         uint kv_offset = dyn_position * out_dim;
-        float v0 = tmpsh[0][0] + tmpsh[0][1] + tmpsh[0][2] + tmpsh[0][3];
-        if (first_row + 1 < out_dim) {
-            float v1 = tmpsh[1][0] + tmpsh[1][1] + tmpsh[1][2] + tmpsh[1][3];
-            uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
-            kv_cache[(kv_offset + first_row) / 2] = packed;
-        } else if (first_row < out_dim) {
-            uint packed = (floatBitsToUint(v0) >> 16);
-            kv_cache[(kv_offset + first_row) / 2] = packed;
+        // Pack pairs of consecutive rows into uint32 KV slots.
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n += 2) {
+            uint row = first_row + n;
+            if (row + 1 < out_dim) {
+                float v0 = row_sum[n];
+                float v1 = row_sum[n + 1];
+#ifdef STORE_F16_KV
+                uint packed = packHalf2x16(vec2(v0, v1));
+#else
+                uint packed = (floatBitsToUint(v0) >> 16) | (floatBitsToUint(v1) & 0xFFFF0000u);
+#endif
+                kv_cache[(kv_offset + row) / 2] = packed;
+            } else if (row < out_dim) {
+                float v0 = row_sum[n];
+#ifdef STORE_F16_KV
+                uint packed = packHalf2x16(vec2(v0, 0.0));
+#else
+                uint packed = (floatBitsToUint(v0) >> 16);
+#endif
+                kv_cache[(kv_offset + row) / 2] = packed;
+            }
         }
 #else
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
             uint row = first_row + n;
             if (row < out_dim) {
-                float result = tmpsh[n][0] + tmpsh[n][1] + tmpsh[n][2] + tmpsh[n][3];
-                output_data[row] = float16_t(result);
+                output_data[row] = row_sum[n];
             }
         }
 #endif

@@ -1,10 +1,8 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
-#extension GL_ARB_gpu_shader_fp64 : enable
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer State { float16_t state[]; };
+layout(set = 0, binding = 0) buffer State { float state[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { float weights[]; };
 
 layout(push_constant) uniform Params {
@@ -12,8 +10,7 @@ layout(push_constant) uniform Params {
     float epsilon;
 };
 
-// f64 sum-of-squares to match llama.cpp's ggml_float.
-shared double shared_sum[256];
+shared float shared_sum[256];
 
 void main() {
     uint batch_idx = gl_WorkGroupID.x;
@@ -21,16 +18,14 @@ void main() {
     uint wg_size = gl_WorkGroupSize.x;
     uint base = batch_idx * dim;
 
-    // Phase 1: compute partial sum of squares
-    double partial = 0.0LF;
+    float partial = 0.0;
     for (uint i = tid; i < dim; i += wg_size) {
-        double v = double(float(state[base + i]));
+        float v = state[base + i];
         partial += v * v;
     }
     shared_sum[tid] = partial;
     barrier();
 
-    // Reduction in shared memory
     for (uint s = wg_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
             shared_sum[tid] += shared_sum[tid + s];
@@ -38,10 +33,9 @@ void main() {
         barrier();
     }
 
-    float inv_rms = float(1.0LF / sqrt(shared_sum[0] / double(dim) + double(epsilon)));
+    float inv_rms = inversesqrt(shared_sum[0] / float(dim) + epsilon);
 
-    // Phase 2: scale
     for (uint i = tid; i < dim; i += wg_size) {
-        state[base + i] = float16_t(float(state[base + i]) * inv_rms * weights[i]);
+        state[base + i] = state[base + i] * inv_rms * weights[i];
     }
 }

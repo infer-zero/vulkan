@@ -1,5 +1,4 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Apply Rotary Position Embeddings (RoPE) to attention activations.
 // Each thread rotates one (cos, sin) pair across the real and imaginary halves.
@@ -7,7 +6,7 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer Data { float16_t data_buf[]; };
+layout(set = 0, binding = 0) buffer Data { float data_buf[]; };
 layout(set = 0, binding = 1) buffer readonly CosTable { float cos_table[]; };
 layout(set = 0, binding = 2) buffer readonly SinTable { float sin_table[]; };
 
@@ -39,12 +38,12 @@ void main() {
     uint base = head * head_dim;
 #endif
 
-    float first = float(data_buf[base + i]);
-    float second = float(data_buf[base + half_dim + i]);
+    float first = data_buf[base + i];
+    float second = data_buf[base + half_dim + i];
 
     float cos_val = cos_table[pos * half_dim + i];
     float sin_val = sin_table[pos * half_dim + i];
 
-    data_buf[base + i] = float16_t(first * cos_val - second * sin_val);
-    data_buf[base + half_dim + i] = float16_t(first * sin_val + second * cos_val);
+    data_buf[base + i] = first * cos_val - second * sin_val;
+    data_buf[base + half_dim + i] = first * sin_val + second * cos_val;
 }

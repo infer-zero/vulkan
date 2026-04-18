@@ -1,11 +1,10 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Coalesced matvec for logits with K-splitting. Same as matmul_q8_0.comp but F32 output.
 
 layout(local_size_x = 512) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
 layout(set = 0, binding = 2) buffer Output { float output_data[]; };
 
@@ -40,7 +39,7 @@ void main() {
     for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_K) {
         if (tid < TILE_K) {
             uint load_idx = tile_start + tid;
-            input_tile[tid] = (load_idx < in_dim) ? float(input_data[load_idx]) : 0.0;
+            input_tile[tid] = (load_idx < in_dim) ? input_data[load_idx] : 0.0;
         }
         barrier();
 

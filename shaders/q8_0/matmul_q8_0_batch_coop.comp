@@ -23,9 +23,9 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Input { float16_t input_data[]; };
+layout(set = 0, binding = 0) buffer readonly Input { float input_data[]; };
 layout(set = 0, binding = 1) buffer readonly Weights { uint weight_data[]; };
-layout(set = 0, binding = 2) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 2) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -35,7 +35,8 @@ layout(push_constant) uniform Params {
 
 shared float16_t A_tile[TILE_M * A_STRIDE];
 shared float16_t B_tile[TILE_N * B_STRIDE];
-shared float scratch[8 * 256];
+// fp16 accumulator → fp16 scratch, cast to f32 on output write.
+shared float16_t scratch[8 * 256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -59,25 +60,25 @@ void main() {
     uint panel_stride = num_blocks * PANEL_N * Q8_BLOCK_SIZE;
     uint scale_section_size = num_blocks * PANEL_N * 2;
 
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc00 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc01 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc10 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc11 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc20 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc21 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc30 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc31 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc00 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc01 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc10 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc11 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc20 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc21 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc30 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
+    fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> acc31 = fcoopmatNV<16, gl_ScopeSubgroup, 16, 16>(0.0);
 
     for (uint block_idx = 0; block_idx < num_blocks; block_idx++) {
         uint k_base = block_idx * 32;
 
-        // Load A tile: f16 activations from global -> shared
+        // Load A tile: f32 activations -> f16 shared (coop matrix expects f16)
         for (uint i = tid; i < TILE_M * TILE_K; i += 256) {
             uint m = i / TILE_K;
             uint k = i % TILE_K;
             uint gm = m_base + m;
             A_tile[m * A_STRIDE + k] = (gm < batch_size)
-                ? input_data[gm * in_dim + k_base + k] : float16_t(0.0);
+                ? float16_t(input_data[gm * in_dim + k_base + k]) : float16_t(0.0);
         }
 
         // Load B tile: Q8_0 dequant to f16 in shared
@@ -151,7 +152,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc01, scratch, sb, 16, false);
@@ -160,7 +161,7 @@ void main() {
         uint gm = out_m + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc10, scratch, sb, 16, false);
@@ -169,7 +170,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc11, scratch, sb, 16, false);
@@ -178,7 +179,7 @@ void main() {
         uint gm = out_m + 16 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc20, scratch, sb, 16, false);
@@ -187,7 +188,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc21, scratch, sb, 16, false);
@@ -196,7 +197,7 @@ void main() {
         uint gm = out_m + 32 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc30, scratch, sb, 16, false);
@@ -205,7 +206,7 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 
     coopMatStoreNV(acc31, scratch, sb, 16, false);
@@ -214,6 +215,6 @@ void main() {
         uint gm = out_m + 48 + i / 16;
         uint gn = out_n + 16 + i % 16;
         if (gm < batch_size && gn < out_dim)
-            output_data[gm * out_dim + gn] = float16_t(scratch[sb + i]);
+            output_data[gm * out_dim + gn] = float(scratch[sb + i]);
     }
 }

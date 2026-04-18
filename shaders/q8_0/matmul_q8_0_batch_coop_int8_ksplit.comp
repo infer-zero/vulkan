@@ -14,7 +14,7 @@
 // WG.x = n_panel * num_k_groups + k_group (flattened N x K-split)
 // WG.y = m_panel
 // Each WG processes its K-range, writes f32 partial sums to buffer.
-// Last WG per (m,n) tile does inline reduce and writes f16 output.
+// Last WG per (m,n) tile does inline reduce and writes f32 output.
 
 #define TILE_M 128
 #define TILE_N 128
@@ -39,7 +39,7 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) buffer readonly Input { int8_t input_data[]; };   // Q8_0 quantized activations
 layout(set = 0, binding = 1) buffer readonly Weights { int8_t weight_data[]; };
 layout(set = 0, binding = 2) buffer coherent PartialAndCounters { uint partial_data[]; };
-layout(set = 0, binding = 3) buffer writeonly Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer writeonly Output { float output_data[]; };
 
 layout(push_constant) uniform Params {
     uint in_dim;
@@ -306,7 +306,7 @@ void main() {
     }
     barrier();
 
-    // Last k_group: reduce all partial sums and write f16 output
+    // Last k_group: reduce all partial sums and write f32 output
     if (shared_reduce_flag == 1u) {
         memoryBarrierBuffer();
 
@@ -323,7 +323,7 @@ void main() {
                 for (uint kg = 0; kg < num_k_groups; kg++) {
                     final_sum += uintBitsToFloat(partial_data[(kg * batch_size + gm) * out_dim + gn]);
                 }
-                output_data[gm * out_dim + gn] = float16_t(final_sum);
+                output_data[gm * out_dim + gn] = final_sum;
             }
         }
 
