@@ -2,7 +2,6 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // FlashDecoding for single-token decode: multiple warps per head.
 // 256 threads = 8 warps of 32. One workgroup per attention head.
@@ -15,10 +14,10 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer readonly Query { float16_t query_data[]; };
+layout(set = 0, binding = 0) buffer readonly Query { float query_data[]; };
 layout(set = 0, binding = 1) buffer readonly KCache { uint k_cache[]; };
 layout(set = 0, binding = 2) buffer readonly VCache { uint v_cache[]; };
-layout(set = 0, binding = 3) buffer Output { float16_t output_data[]; };
+layout(set = 0, binding = 3) buffer Output { float output_data[]; };
 
 layout(set = 1, binding = 0) buffer readonly DynamicParams { uint dyn_token_id; uint dyn_position; uint dyn_capacity; };
 
@@ -79,8 +78,8 @@ void main() {
     float rq[4]; // [pass*2 + 0/1]
     for (uint pass = 0; pass < dim_passes; pass++) {
         uint d0 = pass * 64 + lane * 2;
-        rq[pass * 2]     = float(query_data[q_base + d0]);
-        rq[pass * 2 + 1] = float(query_data[q_base + d0 + 1]);
+        rq[pass * 2]     = query_data[q_base + d0];
+        rq[pass * 2 + 1] = query_data[q_base + d0 + 1];
     }
 
     // Inline RoPE rotation on query
@@ -214,8 +213,8 @@ void main() {
         float inv_l = 1.0 / final_l;
         for (uint pass = 0; pass < dim_passes; pass++) {
             uint d0 = pass * 64 + lane * 2;
-            output_data[out_base + d0]     = float16_t(fo[pass * 2]     * inv_l);
-            output_data[out_base + d0 + 1] = float16_t(fo[pass * 2 + 1] * inv_l);
+            output_data[out_base + d0]     = fo[pass * 2]     * inv_l;
+            output_data[out_base + d0 + 1] = fo[pass * 2 + 1] * inv_l;
         }
     }
 }
