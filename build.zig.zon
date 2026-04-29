@@ -2,11 +2,11 @@
     .name = .vulkan_device,
     .fingerprint = 0x394c415aaf7279e3,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulkan = .{
-            .url = "git+https://github.com/Snektron/vulkan-zig#bed9e2d2241ade679b78892c829f41cecc2ef5ef",
-            .hash = "vulkan-0.0.0-r7YtxwA_AwAU4rmOITZD_KJs11Kie1sv0t-pcMDQGIqw",
+            .url = "git+https://github.com/Snektron/vulkan-zig#5234ae68d1ac143b3ebd1a6e2e40aaa0ef7693c7",
+            .hash = "vulkan-0.0.0-r7Ytx7t9AwBjKG7tnhReEVo0P2fvstTc8G_0qF8iog_V",
         },
         .vulkan_headers = .{
             .url = "git+https://github.com/KhronosGroup/Vulkan-Headers#vulkan-sdk-1.3.283.0",

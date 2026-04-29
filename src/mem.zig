@@ -7,8 +7,8 @@ pub const Info = struct {
     fit: bool,
 };
 
-pub fn checkGpuModelFitsInMemory(path: []const u8) ?Info {
-    const model_bytes = estimateModelSize(path) orelse return null;
+pub fn checkGpuModelFitsInMemory(io: std.Io, path: []const u8) ?Info {
+    const model_bytes = estimateModelSize(io, path) orelse return null;
     const available_bytes = getAvailableGpuMemory() orelse return null;
 
     const model_mib = model_bytes / (1024 * 1024);
@@ -23,28 +23,30 @@ pub fn checkGpuModelFitsInMemory(path: []const u8) ?Info {
     };
 }
 
-fn estimateModelSize(path: []const u8) ?u64 {
+fn estimateModelSize(io: std.Io, path: []const u8) ?u64 {
+    const cwd = std.Io.Dir.cwd();
+
     // Try as single file (GGUF)
-    if (std.fs.cwd().openFile(path, .{})) |file| {
-        defer file.close();
-        const stat = file.stat() catch return null;
+    if (cwd.openFile(io, path, .{})) |file| {
+        defer file.close(io);
+        const stat = file.stat(io) catch return null;
         if (stat.kind == .file) {
             return if (stat.size > 0) stat.size else null;
         }
     } else |_| {}
 
     // Try as directory (HuggingFace with .safetensors files)
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return null;
-    defer dir.close();
+    var dir = cwd.openDir(io, path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
 
     var total: u64 = 0;
     var iter = dir.iterate();
-    while (iter.next() catch return null) |entry| {
+    while (iter.next(io) catch return null) |entry| {
         if (entry.kind != .file) continue;
         if (std.mem.endsWith(u8, entry.name, ".safetensors")) {
-            const file = dir.openFile(entry.name, .{}) catch continue;
-            defer file.close();
-            const stat = file.stat() catch continue;
+            const file = dir.openFile(io, entry.name, .{}) catch continue;
+            defer file.close(io);
+            const stat = file.stat(io) catch continue;
             total += stat.size;
         }
     }

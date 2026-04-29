@@ -227,7 +227,7 @@ pub const VulkanDevice = struct {
                         .b_type = .float16_khr,
                         .c_type = .float16_khr,
                         .result_type = .float16_khr,
-                        .saturating_accumulation = 0,
+                        .saturating_accumulation = .false,
                         .scope = .subgroup_khr,
                     };
                     _ = vki.getPhysicalDeviceCooperativeMatrixPropertiesKHR(selected_device, &prop_count, props.ptr) catch {};
@@ -260,14 +260,14 @@ pub const VulkanDevice = struct {
         if (has_khr_integer_dot_product) {
             // Query whether int8 packed dot product is hardware-accelerated
             var idp_features = vk.PhysicalDeviceShaderIntegerDotProductFeatures{
-                .shader_integer_dot_product = vk.FALSE,
+                .shader_integer_dot_product = .false,
             };
             var features2 = vk.PhysicalDeviceFeatures2{
                 .p_next = @ptrCast(&idp_features),
                 .features = std.mem.zeroes(vk.PhysicalDeviceFeatures),
             };
             vki.getPhysicalDeviceFeatures2(selected_device, &features2);
-            if (idp_features.shader_integer_dot_product == vk.TRUE) {
+            if (idp_features.shader_integer_dot_product == .true) {
                 has_integer_dot_product = true;
                 log.info("integer dot product (dotPacked4x8) supported", .{});
             }
@@ -278,7 +278,7 @@ pub const VulkanDevice = struct {
             .subgroup_size = 0,
             .supported_stages = .{},
             .supported_operations = .{},
-            .quad_operations_in_all_stages = vk.FALSE,
+            .quad_operations_in_all_stages = .false,
         };
         var subgroup_size_ctrl_props = vk.PhysicalDeviceSubgroupSizeControlProperties{
             .p_next = @ptrCast(&subgroup_props),
@@ -316,15 +316,15 @@ pub const VulkanDevice = struct {
         var has_subgroup_size_control = false;
         if (has_subgroup_size_control_ext) {
             var ssc_features = vk.PhysicalDeviceSubgroupSizeControlFeatures{
-                .subgroup_size_control = vk.FALSE,
-                .compute_full_subgroups = vk.FALSE,
+                .subgroup_size_control = .false,
+                .compute_full_subgroups = .false,
             };
             var ssc_features2 = vk.PhysicalDeviceFeatures2{
                 .p_next = @ptrCast(&ssc_features),
                 .features = std.mem.zeroes(vk.PhysicalDeviceFeatures),
             };
             vki.getPhysicalDeviceFeatures2(selected_device, &ssc_features2);
-            has_subgroup_size_control = ssc_features.subgroup_size_control == vk.TRUE;
+            has_subgroup_size_control = ssc_features.subgroup_size_control == .true;
         }
 
         // Auto-detect compute units per vendor
@@ -348,7 +348,7 @@ pub const VulkanDevice = struct {
         };
 
         // Environment variable override
-        if (std.posix.getenv("INFER_COMPUTE_UNITS")) |val| {
+        if (std.c.getenv("INFER_COMPUTE_UNITS")) |val| {
             compute_units = std.fmt.parseInt(u32, std.mem.sliceTo(val, 0), 10) catch compute_units;
         }
 
@@ -392,29 +392,29 @@ pub const VulkanDevice = struct {
         // Chain feature structs into pNext
         var khr_coop_matrix_features = vk.PhysicalDeviceCooperativeMatrixFeaturesKHR{
             .p_next = null,
-            .cooperative_matrix = if (enable_khr_coop) vk.TRUE else vk.FALSE,
-            .cooperative_matrix_robust_buffer_access = vk.FALSE,
+            .cooperative_matrix = if (enable_khr_coop) .true else .false,
+            .cooperative_matrix_robust_buffer_access = .false,
         };
         var coop_matrix_features = vk.PhysicalDeviceCooperativeMatrixFeaturesNV{
             .p_next = if (enable_khr_coop) @ptrCast(&khr_coop_matrix_features) else null,
-            .cooperative_matrix = if (enable_nv_coop) vk.TRUE else vk.FALSE,
-            .cooperative_matrix_robust_buffer_access = vk.FALSE,
+            .cooperative_matrix = if (enable_nv_coop) .true else .false,
+            .cooperative_matrix_robust_buffer_access = .false,
         };
         var idp_enable_features = vk.PhysicalDeviceShaderIntegerDotProductFeatures{
             .p_next = if (enable_nv_coop) @ptrCast(&coop_matrix_features) else if (enable_khr_coop) @ptrCast(&khr_coop_matrix_features) else null,
-            .shader_integer_dot_product = if (has_integer_dot_product) vk.TRUE else vk.FALSE,
+            .shader_integer_dot_product = if (has_integer_dot_product) .true else .false,
         };
         var storage_16bit_features = vk.PhysicalDevice16BitStorageFeatures{
             .p_next = if (has_integer_dot_product or enable_nv_coop) @ptrCast(&idp_enable_features) else null,
-            .storage_buffer_16_bit_access = vk.TRUE,
-            .uniform_and_storage_buffer_16_bit_access = vk.FALSE,
-            .storage_push_constant_16 = vk.FALSE,
-            .storage_input_output_16 = vk.FALSE,
+            .storage_buffer_16_bit_access = .true,
+            .uniform_and_storage_buffer_16_bit_access = .false,
+            .storage_push_constant_16 = .false,
+            .storage_input_output_16 = .false,
         };
         var subgroup_size_ctrl_features = vk.PhysicalDeviceSubgroupSizeControlFeatures{
             .p_next = @ptrCast(&storage_16bit_features),
-            .subgroup_size_control = if (has_subgroup_size_control) vk.TRUE else vk.FALSE,
-            .compute_full_subgroups = vk.FALSE,
+            .subgroup_size_control = if (has_subgroup_size_control) .true else .false,
+            .compute_full_subgroups = .false,
         };
 
         // Enable shaderFloat64 for the f64 sum-of-squares / softmax accumulators
@@ -425,7 +425,7 @@ pub const VulkanDevice = struct {
             .p_next = @ptrCast(&subgroup_size_ctrl_features),
             .features = blk: {
                 var f = std.mem.zeroes(vk.PhysicalDeviceFeatures);
-                f.shader_float_64 = vk.TRUE;
+                f.shader_float_64 = .true;
                 break :blk f;
             },
         };
@@ -609,7 +609,7 @@ pub const VulkanDevice = struct {
 
         const cmd = try self.createCommandBuffer();
         try self.beginCommandBuffer(cmd);
-        self.vkd.cmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &[_]vk.BufferCopy{.{
+        self.vkd.cmdCopyBuffer(cmd, staging.buffer, dst.buffer, &[_]vk.BufferCopy{.{
             .src_offset = 0,
             .dst_offset = 0,
             .size = data.len,
@@ -647,7 +647,7 @@ pub const VulkanDevice = struct {
 
         const cmd = try self.createCommandBuffer();
         try self.beginCommandBuffer(cmd);
-        self.vkd.cmdCopyBuffer(cmd, src.buffer, staging.buffer, 1, &[_]vk.BufferCopy{.{
+        self.vkd.cmdCopyBuffer(cmd, src.buffer, staging.buffer, &[_]vk.BufferCopy{.{
             .src_offset = 0,
             .dst_offset = 0,
             .size = dst.len,
@@ -672,7 +672,7 @@ pub const VulkanDevice = struct {
     }
 
     pub fn freeCommandBuffer(self: *Self, cmd: vk.CommandBuffer) void {
-        self.vkd.freeCommandBuffers(self.device, self.command_pool, 1, &[_]vk.CommandBuffer{cmd});
+        self.vkd.freeCommandBuffers(self.device, self.command_pool, &[_]vk.CommandBuffer{cmd});
     }
 
     pub fn beginCommandBuffer(self: *Self, cmd: vk.CommandBuffer) !void {
@@ -697,8 +697,8 @@ pub const VulkanDevice = struct {
 
     pub fn submitWithFence(self: *Self, cmd: vk.CommandBuffer, fence: vk.Fence) !void {
         const cmds = [_]vk.CommandBuffer{cmd};
-        try self.vkd.resetFences(self.device, 1, &[_]vk.Fence{fence});
-        try self.vkd.queueSubmit(self.compute_queue, 1, &[_]vk.SubmitInfo{.{
+        try self.vkd.resetFences(self.device, &[_]vk.Fence{fence});
+        try self.vkd.queueSubmit(self.compute_queue, &[_]vk.SubmitInfo{.{
             .command_buffer_count = 1,
             .p_command_buffers = &cmds,
         }}, fence);
@@ -709,7 +709,7 @@ pub const VulkanDevice = struct {
         const fences = [_]vk.Fence{fence};
         var iterations: u32 = 0;
         while (iterations < 50_000_000) : (iterations += 1) { // ~5s at 100ns
-            const result = try self.vkd.waitForFences(self.device, 1, &fences, vk.TRUE, 100); // 100 ns timeout
+            const result = try self.vkd.waitForFences(self.device, &fences, .true, 100); // 100 ns timeout
             if (result == .success) return;
         }
         log.err("waitForFence timed out after ~5 seconds", .{});
@@ -756,7 +756,7 @@ pub const VulkanDevice = struct {
 
     pub fn createComputePipeline(self: *Self, shader_module: vk.ShaderModule, layout: vk.PipelineLayout) !vk.Pipeline {
         var pipeline: [1]vk.Pipeline = undefined;
-        _ = try self.vkd.createComputePipelines(self.device, .null_handle, 1, &[_]vk.ComputePipelineCreateInfo{.{
+        _ = try self.vkd.createComputePipelines(self.device, .null_handle, &[_]vk.ComputePipelineCreateInfo{.{
             .stage = .{
                 .stage = .{ .compute_bit = true },
                 .module = shader_module,
@@ -773,7 +773,7 @@ pub const VulkanDevice = struct {
             .required_subgroup_size = 32,
         };
         var pipeline: [1]vk.Pipeline = undefined;
-        _ = try self.vkd.createComputePipelines(self.device, .null_handle, 1, &[_]vk.ComputePipelineCreateInfo{.{
+        _ = try self.vkd.createComputePipelines(self.device, .null_handle, &[_]vk.ComputePipelineCreateInfo{.{
             .stage = .{
                 .p_next = @ptrCast(&required_subgroup_size),
                 .stage = .{ .compute_bit = true },
@@ -824,7 +824,7 @@ pub const VulkanDevice = struct {
             .offset = offset,
             .range = range,
         }};
-        self.vkd.updateDescriptorSets(self.device, 1, &[_]vk.WriteDescriptorSet{.{
+        self.vkd.updateDescriptorSets(self.device, &[_]vk.WriteDescriptorSet{.{
             .dst_set = descriptor_set,
             .dst_binding = binding,
             .dst_array_element = 0,
@@ -833,7 +833,7 @@ pub const VulkanDevice = struct {
             .p_image_info = undefined,
             .p_buffer_info = &buffer_info,
             .p_texel_buffer_view = undefined,
-        }}, 0, null);
+        }}, null);
     }
 
     // --- Command recording helpers ---
@@ -844,12 +844,12 @@ pub const VulkanDevice = struct {
 
     pub fn cmdBindDescriptorSet(self: *Self, cmd: vk.CommandBuffer, layout: vk.PipelineLayout, set: vk.DescriptorSet) void {
         const sets = [_]vk.DescriptorSet{set};
-        self.vkd.cmdBindDescriptorSets(cmd, .compute, layout, 0, 1, &sets, 0, null);
+        self.vkd.cmdBindDescriptorSets(cmd, .compute, layout, 0, &sets, null);
     }
 
     pub fn cmdBindDescriptorSetAt(self: *Self, cmd: vk.CommandBuffer, layout: vk.PipelineLayout, set_index: u32, set: vk.DescriptorSet) void {
         const sets = [_]vk.DescriptorSet{set};
-        self.vkd.cmdBindDescriptorSets(cmd, .compute, layout, set_index, 1, &sets, 0, null);
+        self.vkd.cmdBindDescriptorSets(cmd, .compute, layout, set_index, &sets, null);
     }
 
     pub fn cmdPushConstants(self: *Self, cmd: vk.CommandBuffer, layout: vk.PipelineLayout, data: []const u8) void {
@@ -870,11 +870,8 @@ pub const VulkanDevice = struct {
             .{ .compute_shader_bit = true },
             .{ .compute_shader_bit = true },
             .{},
-            1,
-            @ptrCast(&barrier),
-            0,
+            &[_]vk.MemoryBarrier{barrier},
             null,
-            0,
             null,
         );
     }
@@ -889,11 +886,8 @@ pub const VulkanDevice = struct {
             .{ .transfer_bit = true },
             .{ .compute_shader_bit = true },
             .{},
-            1,
-            @ptrCast(&barrier),
-            0,
+            &[_]vk.MemoryBarrier{barrier},
             null,
-            0,
             null,
         );
     }
@@ -908,11 +902,8 @@ pub const VulkanDevice = struct {
             .{ .compute_shader_bit = true },
             .{ .transfer_bit = true },
             .{},
-            1,
-            @ptrCast(&barrier),
-            0,
+            &[_]vk.MemoryBarrier{barrier},
             null,
-            0,
             null,
         );
     }
@@ -932,17 +923,14 @@ pub const VulkanDevice = struct {
             src_stage,
             dst_stage,
             .{},
-            0,
             null,
-            1,
-            @ptrCast(&barrier),
-            0,
+            &[_]vk.BufferMemoryBarrier{barrier},
             null,
         );
     }
 
     pub fn cmdCopyBuffer(self: *Self, cmd: vk.CommandBuffer, src: vk.Buffer, dst: vk.Buffer, size: vk.DeviceSize) void {
-        self.vkd.cmdCopyBuffer(cmd, src, dst, 1, &[_]vk.BufferCopy{.{
+        self.vkd.cmdCopyBuffer(cmd, src, dst, &[_]vk.BufferCopy{.{
             .src_offset = 0,
             .dst_offset = 0,
             .size = size,
@@ -950,7 +938,7 @@ pub const VulkanDevice = struct {
     }
 
     pub fn cmdCopyBufferOffset(self: *Self, cmd: vk.CommandBuffer, src: vk.Buffer, dst: vk.Buffer, src_offset: vk.DeviceSize, dst_offset: vk.DeviceSize, size: vk.DeviceSize) void {
-        self.vkd.cmdCopyBuffer(cmd, src, dst, 1, &[_]vk.BufferCopy{.{
+        self.vkd.cmdCopyBuffer(cmd, src, dst, &[_]vk.BufferCopy{.{
             .src_offset = src_offset,
             .dst_offset = dst_offset,
             .size = size,
