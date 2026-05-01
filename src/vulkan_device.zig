@@ -83,7 +83,6 @@ pub const VulkanDevice = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, options: InitOptions) !*Self {
-        // Dynamically load libvulkan
         var vk_lib = std.DynLib.open("libvulkan.so.1") catch {
             log.err("failed to load libvulkan.so.1", .{});
             return error.VulkanUnavailable;
@@ -95,10 +94,8 @@ pub const VulkanDevice = struct {
             return error.VulkanUnavailable;
         };
 
-        // Load base dispatch (global Vulkan functions)
         const vkb = vk.BaseWrapper.load(get_instance_proc_addr);
 
-        // Create instance
         const app_info = vk.ApplicationInfo{
             .api_version = @bitCast(vk.API_VERSION_1_1),
             .application_version = 0,
@@ -113,10 +110,8 @@ pub const VulkanDevice = struct {
             return error.VulkanUnavailable;
         };
 
-        // Load instance dispatch
         const vki = vk.InstanceWrapper.load(instance, get_instance_proc_addr);
 
-        // Enumerate physical devices
         var device_count: u32 = 0;
         _ = vki.enumeratePhysicalDevices(instance, &device_count, null) catch return error.VulkanUnavailable;
         if (device_count == 0) {
