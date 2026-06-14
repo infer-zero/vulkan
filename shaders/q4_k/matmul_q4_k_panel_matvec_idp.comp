@@ -29,7 +29,14 @@ layout(push_constant) uniform Params {
     uint out_dim;
 };
 
+// Plain output runs 4 rows/workgroup (more rows = more in-flight weight
+// loads = better DRAM utilization on this latency-bound matvec). The
+// STORE_BF16_KV variant keeps 2 so its bf16 row-pair packing is unchanged.
+#ifdef STORE_BF16_KV
 #define NUM_ROWS 2
+#else
+#define NUM_ROWS 4
+#endif
 #define PANEL_N 128
 #define Q4_K_BLOCK_SIZE 144
 #define Q4_K_HEADER_BYTES 16

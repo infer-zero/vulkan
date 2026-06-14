@@ -19,7 +19,7 @@ layout(push_constant) uniform Params {
     uint out_dim;
 };
 
-#define NUM_ROWS 2
+#define NUM_ROWS 4
 #define PANEL_N 128
 #define Q4_K_BLOCK_SIZE 144
 #define Q4_K_HEADER_BYTES 16

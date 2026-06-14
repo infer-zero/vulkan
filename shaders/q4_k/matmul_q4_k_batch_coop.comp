@@ -1,12 +1,19 @@
 #version 450
-#extension GL_NV_cooperative_matrix : enable
+#extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
 // Cooperative matrix GEMM for Q4_K weights: C[M,N] = A[M,K] x B^T[N,K]
-// Q4_K dequant to f16 in shared memory, then fp16 NV coop matrix MMA.
-// Stride must be a multiple of 8 (fp16 elements) for NV coop matrix loads.
+// Q4_K dequant to f16 in shared memory, then fp16 KHR coop-matrix MMA
+// (fp16xfp16 -> f32, 16x16x16). KHR is llama.cpp's path; NV and KHR cannot be
+// enabled together (~4x driver regression), so the device runs prefer_khr and
+// every coop shader here is KHR.
+//
+// Tiling kept from the best-performing NV layout: 256 threads / 8 subgroups
+// (2 rows x 4 cols), each subgroup a 64x32 tile = 4x2 grid of 16x16 MMAs
+// (8 accumulators/subgroup). This was register-occupancy optimal here; larger
+// per-warp tiles (16 acc) regressed.
 
 #define TILE_M 128
 #define TILE_N 128
@@ -25,6 +32,10 @@
 #define Q4_K_HEADER_BYTES 16
 #define Q4_K_DATA_BYTES 128
 #define SUPER_BLOCK_ELEMS 256
+
+#define mat_a   coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define mat_b   coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define mat_acc coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 layout(local_size_x = 256) in;
 
@@ -76,14 +87,14 @@ void main() {
     uint panel_stride = num_super_blocks * PANEL_N * Q4_K_BLOCK_SIZE;
     uint header_section_size = num_super_blocks * PANEL_N * Q4_K_HEADER_BYTES;
 
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc00 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc01 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc10 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc11 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc20 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc21 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc30 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
-    fcoopmatNV<32, gl_ScopeSubgroup, 16, 16> acc31 = fcoopmatNV<32, gl_ScopeSubgroup, 16, 16>(0.0);
+    mat_acc acc00 = mat_acc(0.0);
+    mat_acc acc01 = mat_acc(0.0);
+    mat_acc acc10 = mat_acc(0.0);
+    mat_acc acc11 = mat_acc(0.0);
+    mat_acc acc20 = mat_acc(0.0);
+    mat_acc acc21 = mat_acc(0.0);
+    mat_acc acc30 = mat_acc(0.0);
+    mat_acc acc31 = mat_acc(0.0);
 
     uint total_sub_blocks = num_super_blocks * 8u;
 
@@ -148,33 +159,36 @@ void main() {
 
         barrier();
 
-        fcoopmatNV<16, gl_ScopeSubgroup, 16, 16> a0, a1, a2, a3, b0, b1;
+        // A loaded row-major (M x K); B loaded column-major so it reads as
+        // (K x N) from the N x K shared store, giving A x B^T.
+        mat_a a0, a1, a2, a3;
+        mat_b b0, b1;
 
         // K-slice 0
-        coopMatLoadNV(a0, A_tile, (sg_m_base +  0) * A_STRIDE, A_STRIDE, false);
-        coopMatLoadNV(a1, A_tile, (sg_m_base + 16) * A_STRIDE, A_STRIDE, false);
-        coopMatLoadNV(a2, A_tile, (sg_m_base + 32) * A_STRIDE, A_STRIDE, false);
-        coopMatLoadNV(a3, A_tile, (sg_m_base + 48) * A_STRIDE, A_STRIDE, false);
-        coopMatLoadNV(b0, B_tile, (sg_n_base +  0) * B_STRIDE, B_STRIDE, true);
-        coopMatLoadNV(b1, B_tile, (sg_n_base + 16) * B_STRIDE, B_STRIDE, true);
+        coopMatLoad(a0, A_tile, (sg_m_base +  0) * A_STRIDE, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a1, A_tile, (sg_m_base + 16) * A_STRIDE, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a2, A_tile, (sg_m_base + 32) * A_STRIDE, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a3, A_tile, (sg_m_base + 48) * A_STRIDE, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b0, B_tile, (sg_n_base +  0) * B_STRIDE, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b1, B_tile, (sg_n_base + 16) * B_STRIDE, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
 
-        acc00 = coopMatMulAddNV(a0, b0, acc00);  acc01 = coopMatMulAddNV(a0, b1, acc01);
-        acc10 = coopMatMulAddNV(a1, b0, acc10);  acc11 = coopMatMulAddNV(a1, b1, acc11);
-        acc20 = coopMatMulAddNV(a2, b0, acc20);  acc21 = coopMatMulAddNV(a2, b1, acc21);
-        acc30 = coopMatMulAddNV(a3, b0, acc30);  acc31 = coopMatMulAddNV(a3, b1, acc31);
+        acc00 = coopMatMulAdd(a0, b0, acc00);  acc01 = coopMatMulAdd(a0, b1, acc01);
+        acc10 = coopMatMulAdd(a1, b0, acc10);  acc11 = coopMatMulAdd(a1, b1, acc11);
+        acc20 = coopMatMulAdd(a2, b0, acc20);  acc21 = coopMatMulAdd(a2, b1, acc21);
+        acc30 = coopMatMulAdd(a3, b0, acc30);  acc31 = coopMatMulAdd(a3, b1, acc31);
 
         // K-slice 1
-        coopMatLoadNV(a0, A_tile, (sg_m_base +  0) * A_STRIDE + 16, A_STRIDE, false);
-        coopMatLoadNV(a1, A_tile, (sg_m_base + 16) * A_STRIDE + 16, A_STRIDE, false);
-        coopMatLoadNV(a2, A_tile, (sg_m_base + 32) * A_STRIDE + 16, A_STRIDE, false);
-        coopMatLoadNV(a3, A_tile, (sg_m_base + 48) * A_STRIDE + 16, A_STRIDE, false);
-        coopMatLoadNV(b0, B_tile, (sg_n_base +  0) * B_STRIDE + 16, B_STRIDE, true);
-        coopMatLoadNV(b1, B_tile, (sg_n_base + 16) * B_STRIDE + 16, B_STRIDE, true);
+        coopMatLoad(a0, A_tile, (sg_m_base +  0) * A_STRIDE + 16, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a1, A_tile, (sg_m_base + 16) * A_STRIDE + 16, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a2, A_tile, (sg_m_base + 32) * A_STRIDE + 16, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(a3, A_tile, (sg_m_base + 48) * A_STRIDE + 16, A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b0, B_tile, (sg_n_base +  0) * B_STRIDE + 16, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b1, B_tile, (sg_n_base + 16) * B_STRIDE + 16, B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
 
-        acc00 = coopMatMulAddNV(a0, b0, acc00);  acc01 = coopMatMulAddNV(a0, b1, acc01);
-        acc10 = coopMatMulAddNV(a1, b0, acc10);  acc11 = coopMatMulAddNV(a1, b1, acc11);
-        acc20 = coopMatMulAddNV(a2, b0, acc20);  acc21 = coopMatMulAddNV(a2, b1, acc21);
-        acc30 = coopMatMulAddNV(a3, b0, acc30);  acc31 = coopMatMulAddNV(a3, b1, acc31);
+        acc00 = coopMatMulAdd(a0, b0, acc00);  acc01 = coopMatMulAdd(a0, b1, acc01);
+        acc10 = coopMatMulAdd(a1, b0, acc10);  acc11 = coopMatMulAdd(a1, b1, acc11);
+        acc20 = coopMatMulAdd(a2, b0, acc20);  acc21 = coopMatMulAdd(a2, b1, acc21);
+        acc30 = coopMatMulAdd(a3, b0, acc30);  acc31 = coopMatMulAdd(a3, b1, acc31);
 
         barrier();
     }
@@ -187,7 +201,7 @@ void main() {
     uint sb = sg_id * 256;
 
     #define WRITE_TILE(acc_mat, m_off, n_off)                                       \
-    coopMatStoreNV(acc_mat, scratch, sb, 16, false);                                \
+    coopMatStore(acc_mat, scratch, sb, 16, gl_CooperativeMatrixLayoutRowMajor);     \
     subgroupMemoryBarrierShared();                                                  \
     for (uint i = sg_lane; i < 256; i += 32) {                                     \
         uint gm = out_m + m_off + i / 16;                                          \
