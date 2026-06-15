@@ -7,6 +7,7 @@ pub const VulkanDevice = vulkan_device.VulkanDevice;
 pub const GpuBuffer = vulkan_device.GpuBuffer;
 pub const CoopPreference = vulkan_device.CoopPreference;
 pub const InitOptions = vulkan_device.InitOptions;
+pub const DeviceInfo = vulkan_device.DeviceInfo;
 pub const VulkanError = vulkan_device.VulkanError;
 
 // Re-export vulkan types

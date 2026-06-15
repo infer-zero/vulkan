@@ -27,6 +27,23 @@ pub const CoopPreference = enum { prefer_nv, prefer_khr };
 
 pub const InitOptions = struct {
     coop_preference: CoopPreference = .prefer_nv,
+    // Which physical device to use. null = auto (prefer a discrete GPU).
+    // Otherwise the index into the list returned by enumerateDevices().
+    device_index: ?u32 = null,
+};
+
+// Lightweight description of an available physical device, returned by
+// enumerateDevices(). `index` is what you pass back as InitOptions.device_index.
+pub const DeviceInfo = struct {
+    index: u32,
+    vendor_id: u32,
+    device_id: u32,
+    device_type: vk.PhysicalDeviceType,
+    name_buf: [256]u8,
+
+    pub fn name(self: *const DeviceInfo) []const u8 {
+        return std.mem.sliceTo(&self.name_buf, 0);
+    }
 };
 
 pub const VulkanDevice = struct {
@@ -82,6 +99,51 @@ pub const VulkanDevice = struct {
 
     const Self = @This();
 
+    // List the available physical devices without bringing up a full device.
+    // Caller owns the returned slice and must free it. The `index` field of
+    // each entry is what you pass back as InitOptions.device_index.
+    pub fn enumerateDevices(allocator: std.mem.Allocator) ![]DeviceInfo {
+        var vk_lib = std.DynLib.open("libvulkan.so.1") catch return error.VulkanUnavailable;
+        defer vk_lib.close();
+
+        const get_instance_proc_addr = vk_lib.lookup(vk.PfnGetInstanceProcAddr, "vkGetInstanceProcAddr") orelse
+            return error.VulkanUnavailable;
+        const vkb = vk.BaseWrapper.load(get_instance_proc_addr);
+
+        const app_info = vk.ApplicationInfo{
+            .api_version = @bitCast(vk.API_VERSION_1_1),
+            .application_version = 0,
+            .engine_version = 0,
+            .p_application_name = "infer",
+            .p_engine_name = "infer",
+        };
+        const instance = vkb.createInstance(&.{ .p_application_info = &app_info }, null) catch
+            return error.VulkanUnavailable;
+        const vki = vk.InstanceWrapper.load(instance, get_instance_proc_addr);
+        defer vki.destroyInstance(instance, null);
+
+        var device_count: u32 = 0;
+        _ = vki.enumeratePhysicalDevices(instance, &device_count, null) catch return error.VulkanUnavailable;
+        const devices = try allocator.alloc(vk.PhysicalDevice, device_count);
+        defer allocator.free(devices);
+        _ = vki.enumeratePhysicalDevices(instance, &device_count, devices.ptr) catch return error.VulkanUnavailable;
+
+        const infos = try allocator.alloc(DeviceInfo, device_count);
+        errdefer allocator.free(infos);
+        for (devices[0..device_count], 0..) |dev, i| {
+            const props = vki.getPhysicalDeviceProperties(dev);
+            infos[i] = .{
+                .index = @intCast(i),
+                .vendor_id = props.vendor_id,
+                .device_id = props.device_id,
+                .device_type = props.device_type,
+                .name_buf = undefined,
+            };
+            @memcpy(infos[i].name_buf[0..], props.device_name[0..]);
+        }
+        return infos;
+    }
+
     pub fn init(allocator: std.mem.Allocator, options: InitOptions) !*Self {
         var vk_lib = std.DynLib.open("libvulkan.so.1") catch {
             log.err("failed to load libvulkan.so.1", .{});
@@ -123,17 +185,25 @@ pub const VulkanDevice = struct {
         defer allocator.free(devices);
         _ = vki.enumeratePhysicalDevices(instance, &device_count, devices.ptr) catch return error.VulkanUnavailable;
 
-        // Select best device (prefer discrete GPU)
+        // Pick the device: an explicit index wins; otherwise prefer a discrete GPU.
         var selected_device = devices[0];
-        var selected_props = vki.getPhysicalDeviceProperties(selected_device);
-
-        for (devices[1..device_count]) |dev| {
-            const props = vki.getPhysicalDeviceProperties(dev);
-            if (props.device_type == .discrete_gpu and selected_props.device_type != .discrete_gpu) {
-                selected_device = dev;
-                selected_props = props;
+        if (options.device_index) |idx| {
+            if (idx >= device_count) {
+                log.err("requested GPU index {} out of range ({} device(s) available)", .{ idx, device_count });
+                return error.VulkanUnavailable;
+            }
+            selected_device = devices[idx];
+        } else {
+            var selected_type = vki.getPhysicalDeviceProperties(selected_device).device_type;
+            for (devices[1..device_count]) |dev| {
+                const props = vki.getPhysicalDeviceProperties(dev);
+                if (props.device_type == .discrete_gpu and selected_type != .discrete_gpu) {
+                    selected_device = dev;
+                    selected_type = props.device_type;
+                }
             }
         }
+        const selected_props = vki.getPhysicalDeviceProperties(selected_device);
 
         const device_name: [*:0]const u8 = @ptrCast(&selected_props.device_name);
         log.info("Vulkan device: {s}", .{device_name});
