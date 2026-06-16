@@ -26,6 +26,8 @@ layout(push_constant) uniform PC {
     float rope_theta;
     uint layer_idx;
     float cen[8];
+    // Sliding-window size (0 = full causal). Query at p attends key j when p - j < window.
+    uint window;
 };
 
 #define TILE_Q 8
@@ -77,7 +79,8 @@ void main() {
         if (tid < head_dim) q_temp[tid] = float(query_data[q_base + tid]);
         barrier();
 
-        // RoPE
+        // RoPE (skipped when Q is pre-roped by a table-based pass)
+#ifndef Q_PREROPED
         uint position = start_position + query_idx;
         if (tid < half_dim) {
             float freq = 1.0 / pow(rope_theta, float(tid * 2) / float(head_dim));
@@ -89,6 +92,7 @@ void main() {
             q_temp[tid + half_dim] = first * sin_val + second * cos_val;
         }
         barrier();
+#endif
 
         // RHT
         if (tid < head_dim) q_temp[tid] *= sign_data[rht_sign_offset + tid];
@@ -140,7 +144,16 @@ void main() {
     uint max_query_idx = min(q_tile_idx * TILE_Q + TILE_Q, batch_size);
     uint max_kv_count = start_position + max_query_idx;
 
-    for (uint kv_tile = 0; kv_tile < max_kv_count; kv_tile += TILE_KV) {
+    // Sliding-window: skip key tiles fully older than the window for this
+    // query tile (the per-(qi,ki) mask below handles the exact boundary).
+    uint kv_lo = 0u;
+    if (window > 0u) {
+        uint qpos_min = start_position + q_tile_idx * TILE_Q;
+        uint lo = (qpos_min + 1u > window) ? (qpos_min + 1u - window) : 0u;
+        kv_lo = (lo / TILE_KV) * TILE_KV;
+    }
+
+    for (uint kv_tile = kv_lo; kv_tile < max_kv_count; kv_tile += TILE_KV) {
         uint tile_size = min(TILE_KV, max_kv_count - kv_tile);
 
         // ---- Compute Q.K scores (MSE + QJL correction) ----
@@ -150,7 +163,8 @@ void main() {
             uint kv_pos = kv_tile + ki;
 
             uint query_idx = q_tile_idx * TILE_Q + qi;
-            if (query_idx >= batch_size || kv_pos >= start_position + query_idx + 1) {
+            uint qpos = start_position + query_idx;
+            if (query_idx >= batch_size || kv_pos > qpos || (window > 0u && (qpos - kv_pos) >= window)) {
                 dot_scores[qi * TILE_KV + ki] = -1.0 / 0.0;
                 continue;
             }
@@ -211,6 +225,10 @@ void main() {
                 float tile_max = -1.0 / 0.0;
                 for (uint ki = 0; ki < tile_size; ki++)
                     tile_max = max(tile_max, dot_scores[qi * TILE_KV + ki]);
+
+                // All keys in this tile masked for this query (causal or
+                // outside the sliding window) → skip; avoids exp(-inf - -inf).
+                if (tile_max == -1.0 / 0.0) continue;
 
                 float new_m = max(m_vals[qi], tile_max);
                 float correction = exp(m_vals[qi] - new_m);
